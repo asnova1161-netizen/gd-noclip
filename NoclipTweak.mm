@@ -15,6 +15,7 @@
 
 #include <stdint.h>
 #include <string.h>
+#include <math.h>
 
 // ---------------------------------------------------------------------------
 // Noclip engine
@@ -29,11 +30,19 @@
 
 #define GD_RESET_OFF     0x11a550ULL
 #define GD_RESTART_FLAG  0x367e
+#define GD_PLAYER_DEAD   0x9da
+#define GD_LAYER_DYING   0x30a2
+
+#define GD_SPEED_MIN     0.1f
+#define GD_SPEED_MAX     100.0f
 
 static BOOL        gEnabled = NO;
 static BOOL        gAutoRestart = NO;
 static BOOL        gBinaryOK = NO;
 static BOOL        gResetOK = NO;
+static BOOL        gResetting = NO;
+static BOOL        gPendingReset = NO;
+static CFTimeInterval gLastReset = 0.0;
 static uintptr_t   gImageBase = 0;
 static void       *gOrigDestroyPlayer = NULL;
 static void       *gOrigUpdate = NULL;
@@ -43,29 +52,68 @@ typedef void (*DestroyPlayerFn)(void *self, void *player, void *object);
 typedef void (*UpdateFn)(void *self, float dt);
 typedef void (*ResetLevelFn)(void *self);
 
+static float NJSpeedToSlider(float speed)
+{
+    if (speed < GD_SPEED_MIN) speed = GD_SPEED_MIN;
+    if (speed > GD_SPEED_MAX) speed = GD_SPEED_MAX;
+    return logf(speed / GD_SPEED_MIN) / logf(GD_SPEED_MAX / GD_SPEED_MIN);
+}
+
+static float NJSliderToSpeed(float value)
+{
+    if (value < 0.0f) value = 0.0f;
+    if (value > 1.0f) value = 1.0f;
+    return GD_SPEED_MIN * powf(GD_SPEED_MAX / GD_SPEED_MIN, value);
+}
+
+static NSString *NJSpeedText(float speed)
+{
+    if (speed < 10.0f) return [NSString stringWithFormat:@"%.2f\u00d7", speed];
+    return [NSString stringWithFormat:@"%.0f\u00d7", speed];
+}
+
 static void noclip_destroy_player(void *self, void *player, void *object)
 {
     if (gEnabled) return;           // noclip: swallow the death
+
+    // Detect whether this is a fresh death. If the player is already dead (or
+    // the layer is already in its death sequence), this call is a replay of an
+    // old death (for example from resetLevel), not a new one. Never arm an
+    // instant respawn for those, otherwise enabling the toggle can start a
+    // reset loop.
+    void *player1 = *(void **)((char *)self + 0xc90);
+    BOOL wasDead = player1 && *(uint8_t *)((char *)player1 + GD_PLAYER_DEAD);
+    BOOL wasDying = *(uint8_t *)((char *)self + GD_LAYER_DYING);
+
     if (gOrigDestroyPlayer) ((DestroyPlayerFn)gOrigDestroyPlayer)(self, player, object);
 
-    if (gAutoRestart && gResetOK) {
-        // Run the reset on the next main-queue turn. The death function has
-        // already returned by then, so it is safe to tear down the level, and
-        // it does not wait for the death animation or any game update.
-        void *layer = self;
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (!gAutoRestart || !gResetOK) return;
-            *((uint8_t *)layer + GD_RESTART_FLAG) = 0; // cancel delayed auto-restart
-            ((ResetLevelFn)(gImageBase + GD_RESET_OFF))(layer);
-        });
-    }
+    if (!gOrigDestroyPlayer || !gAutoRestart || !gResetOK) return;
+    if (gResetting || gPendingReset || wasDead || wasDying) return;
+    if (CACurrentMediaTime() - gLastReset < 0.10) return;
+
+    // Run the reset on the next main-queue turn. The death function has
+    // already returned by then, so it is safe to tear down the level, and it
+    // does not wait for the death animation or any game update.
+    void *layer = self;
+    gPendingReset = YES;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        gPendingReset = NO;
+        if (!gAutoRestart || !gResetOK || gResetting) return;
+
+        gResetting = YES;
+        *((uint8_t *)layer + GD_RESTART_FLAG) = 0; // cancel delayed auto-restart
+        ((ResetLevelFn)(gImageBase + GD_RESET_OFF))(layer);
+        *((uint8_t *)layer + GD_RESTART_FLAG) = 0; // in case reset re-armed it
+        gLastReset = CACurrentMediaTime();
+        gResetting = NO;
+    });
 }
 
 static void noclip_update(void *self, float dt)
 {
     if (!gOrigUpdate) return;
     float scale = gSpeed;
-    if (scale < 0.1f || scale > 10.0f) scale = 1.0f;
+    if (scale < GD_SPEED_MIN || scale > GD_SPEED_MAX) scale = 1.0f;
     ((UpdateFn)gOrigUpdate)(self, dt * scale);
 }
 
@@ -373,9 +421,9 @@ static UILabel *NJLabel(NSString *text, CGFloat size, UIFontWeight weight, UICol
     [self.panel addSubview:speedLabel];
 
     self.speedSlider = [[UISlider alloc] initWithFrame:CGRectMake(78, 91, 140, 31)];
-    self.speedSlider.minimumValue = 0.1f;
-    self.speedSlider.maximumValue = 4.0f;
-    self.speedSlider.value = gSpeed;
+    self.speedSlider.minimumValue = 0.0f;
+    self.speedSlider.maximumValue = 1.0f;
+    self.speedSlider.value = NJSpeedToSlider(gSpeed);
     self.speedSlider.minimumTrackTintColor = NJAccent();
     self.speedSlider.maximumTrackTintColor = [UIColor colorWithWhite:1.0 alpha:0.12];
     self.speedSlider.thumbTintColor = [UIColor whiteColor];
@@ -383,7 +431,7 @@ static UILabel *NJLabel(NSString *text, CGFloat size, UIFontWeight weight, UICol
     [self.speedSlider addTarget:self action:@selector(speedChanged:) forControlEvents:UIControlEventValueChanged];
     [self.panel addSubview:self.speedSlider];
 
-    self.speedValue = NJLabel([NSString stringWithFormat:@"%.1f\u00d7", gSpeed], 12.0, UIFontWeightSemibold, NJText(), 0.0);
+    self.speedValue = NJLabel(NJSpeedText(gSpeed), 12.0, UIFontWeightSemibold, NJText(), 0.0);
     self.speedValue.textAlignment = NSTextAlignmentRight;
     self.speedValue.frame = CGRectMake(pw - 72, 98, 56, 18);
     [self.panel addSubview:self.speedValue];
@@ -414,13 +462,13 @@ static UILabel *NJLabel(NSString *text, CGFloat size, UIFontWeight weight, UICol
 
 - (void)speedChanged:(UISlider *)sender
 {
-    float value = sender.value;
-    if (value > 0.94f && value < 1.06f) {
+    float value = NJSliderToSpeed(sender.value);
+    if (fabsf(value - 1.0f) < 0.05f) {
         value = 1.0f;
-        sender.value = 1.0f;
+        sender.value = NJSpeedToSlider(1.0f);
     }
     gSpeed = value;
-    self.speedValue.text = [NSString stringWithFormat:@"%.1f\u00d7", value];
+    self.speedValue.text = NJSpeedText(value);
     [[NSUserDefaults standardUserDefaults] setFloat:value forKey:@"noclip.speed"];
 }
 
@@ -608,8 +656,8 @@ static void noclip_boot(void)
             gAutoRestart = [[NSUserDefaults standardUserDefaults] boolForKey:@"noclip.instantRestart"];
             gSpeed = [[NSUserDefaults standardUserDefaults] floatForKey:@"noclip.speed"];
             if (gSpeed <= 0.0f) gSpeed = 1.0f;
-            if (gSpeed < 0.1f) gSpeed = 0.1f;
-            if (gSpeed > 4.0f) gSpeed = 4.0f;
+            if (gSpeed < GD_SPEED_MIN) gSpeed = GD_SPEED_MIN;
+            if (gSpeed > GD_SPEED_MAX) gSpeed = GD_SPEED_MAX;
 
             dispatch_async(dispatch_get_main_queue(), ^{
                 gd_probe();
