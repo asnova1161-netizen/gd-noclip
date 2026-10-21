@@ -133,6 +133,17 @@ static UILabel *NJLabel(NSString *text, CGFloat size, UIFontWeight weight, UICol
 // Menu
 // ---------------------------------------------------------------------------
 
+@interface NJTriggerView : UIView
+@end
+
+@implementation NJTriggerView
+// Slightly larger hit area than the 34pt circle, so the button is easy to grab.
+- (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event
+{
+    return CGRectContainsPoint(CGRectInset(self.bounds, -10.0, -10.0), point);
+}
+@end
+
 @interface NJMenuController : UIViewController <UIGestureRecognizerDelegate>
 @property (nonatomic, strong) UIView *trigger;
 @property (nonatomic, strong) UILabel *triggerLabel;
@@ -150,6 +161,8 @@ static UILabel *NJLabel(NSString *text, CGFloat size, UIFontWeight weight, UICol
 @property (nonatomic, assign) BOOL panelVisible;
 @property (nonatomic, assign) BOOL draggingTrigger;
 @property (nonatomic, assign) BOOL draggingPanel;
+@property (nonatomic, assign) CGPoint dragOffset;
+@property (nonatomic, weak) UIView *hostView;
 - (void)layoutMenu;
 @end
 
@@ -190,6 +203,14 @@ static UILabel *NJLabel(NSString *text, CGFloat size, UIFontWeight weight, UICol
 
 - (void)layoutMenu
 {
+    UIView *host = self.hostView;
+    if (host) {
+        CGRect hb = host.bounds;
+        if (hb.size.width > 0.0 && hb.size.height > 0.0 && !CGRectEqualToRect(self.view.frame, hb)) {
+            self.view.frame = hb;
+        }
+    }
+
     CGRect bounds = self.view.bounds;
     CGFloat w = bounds.size.width;
     CGFloat h = bounds.size.height;
@@ -211,12 +232,14 @@ static UILabel *NJLabel(NSString *text, CGFloat size, UIFontWeight weight, UICol
 - (void)buildTrigger
 {
     CGFloat side = 34.0;
-    self.trigger = [[UIView alloc] initWithFrame:CGRectMake(0, 0, side, side)];
+    self.trigger = [[NJTriggerView alloc] initWithFrame:CGRectMake(0, 0, side, side)];
     self.trigger.backgroundColor = [UIColor clearColor];
     self.trigger.layer.cornerRadius = 17.0;
     self.trigger.layer.masksToBounds = YES;
     self.trigger.layer.borderWidth = 1.0;
     self.trigger.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.22].CGColor;
+    self.trigger.layer.shouldRasterize = YES;
+    self.trigger.layer.rasterizationScale = [UIScreen mainScreen].scale;
     self.trigger.userInteractionEnabled = YES;
 
     CAGradientLayer *grad = [CAGradientLayer layer];
@@ -237,6 +260,10 @@ static UILabel *NJLabel(NSString *text, CGFloat size, UIFontWeight weight, UICol
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(triggerPanned:)];
     tap.delegate = self;
     pan.delegate = self;
+    tap.delaysTouchesBegan = NO;
+    pan.delaysTouchesBegan = NO;
+    pan.delaysTouchesEnded = NO;
+    pan.maximumNumberOfTouches = 1;
     [tap requireGestureRecognizerToFail:pan];
     [self.trigger addGestureRecognizer:tap];
     [self.trigger addGestureRecognizer:pan];
@@ -253,6 +280,8 @@ static UILabel *NJLabel(NSString *text, CGFloat size, UIFontWeight weight, UICol
     self.panel.layer.cornerRadius = 16.0;
     self.panel.layer.borderWidth = 1.0;
     self.panel.layer.borderColor = NJLine().CGColor;
+    self.panel.layer.shouldRasterize = YES;
+    self.panel.layer.rasterizationScale = [UIScreen mainScreen].scale;
     self.panel.userInteractionEnabled = YES;
 
     // Header
@@ -280,6 +309,9 @@ static UILabel *NJLabel(NSString *text, CGFloat size, UIFontWeight weight, UICol
 
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(panelPanned:)];
     pan.delegate = self;
+    pan.delaysTouchesBegan = NO;
+    pan.delaysTouchesEnded = NO;
+    pan.maximumNumberOfTouches = 1;
     [self.panelHeader addGestureRecognizer:pan];
 
     // Sidebar (vertical tab rail, Ascent style)
@@ -460,13 +492,13 @@ static UILabel *NJLabel(NSString *text, CGFloat size, UIFontWeight weight, UICol
 
 - (void)triggerPanned:(UIPanGestureRecognizer *)pan
 {
-    CGPoint t = [pan translationInView:self.view];
+    CGPoint p = [pan locationInView:self.view];
     if (pan.state == UIGestureRecognizerStateBegan) {
         self.draggingTrigger = YES;
+        self.dragOffset = CGPointMake(self.trigger.center.x - p.x, self.trigger.center.y - p.y);
     } else if (pan.state == UIGestureRecognizerStateChanged) {
-        CGPoint c = CGPointMake(self.trigger.center.x + t.x, self.trigger.center.y + t.y);
+        CGPoint c = CGPointMake(p.x + self.dragOffset.x, p.y + self.dragOffset.y);
         self.trigger.center = [self clampTrigger:c inBounds:self.view.bounds];
-        [pan setTranslation:CGPointZero inView:self.view];
     } else if (pan.state == UIGestureRecognizerStateEnded || pan.state == UIGestureRecognizerStateCancelled) {
         self.draggingTrigger = NO;
         CGRect b = self.view.bounds;
@@ -478,16 +510,33 @@ static UILabel *NJLabel(NSString *text, CGFloat size, UIFontWeight weight, UICol
 
 - (void)panelPanned:(UIPanGestureRecognizer *)pan
 {
-    CGPoint t = [pan translationInView:self.view];
+    CGPoint p = [pan locationInView:self.view];
     if (pan.state == UIGestureRecognizerStateBegan) {
         self.draggingPanel = YES;
+        self.dragOffset = CGPointMake(self.panel.center.x - p.x, self.panel.center.y - p.y);
     } else if (pan.state == UIGestureRecognizerStateChanged) {
-        CGPoint c = CGPointMake(self.panel.center.x + t.x, self.panel.center.y + t.y);
+        CGPoint c = CGPointMake(p.x + self.dragOffset.x, p.y + self.dragOffset.y);
         self.panel.center = [self clampPanel:c inBounds:self.view.bounds];
-        [pan setTranslation:CGPointZero inView:self.view];
     } else if (pan.state == UIGestureRecognizerStateEnded || pan.state == UIGestureRecognizerStateCancelled) {
         self.draggingPanel = NO;
     }
+}
+
+- (void)observeValueForKeyPath:(NSString *)keyPath ofObject:(id)object change:(NSDictionary *)change context:(void *)context
+{
+    if ([keyPath isEqualToString:@"bounds"] && object == self.hostView) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self layoutMenu];
+        });
+        return;
+    }
+    [super observeValueForKeyPath:keyPath ofObject:object change:change context:context];
+}
+
+- (void)dealloc
+{
+    UIView *h = self.hostView;
+    if (h) [h removeObserver:self forKeyPath:@"bounds"];
 }
 
 - (CGPoint)clampTrigger:(CGPoint)c inBounds:(CGRect)b
@@ -521,13 +570,14 @@ static UILabel *NJLabel(NSString *text, CGFloat size, UIFontWeight weight, UICol
 // ---------------------------------------------------------------------------
 
 static NJMenuController *gController = nil;
+static UIView *gHostView = nil;
 
 static void NJInstallMenu(void)
 {
     if (gController) return;
 
-    // Wait for the game's own landscape window; hosting the overlay there makes
-    // it inherit the exact bounds and keeps panning in the same coordinate space.
+    // Wait for the game's own landscape window; hosting the overlay inside its
+    // root view guarantees the exact landscape coordinate space.
     UIWindow *host = [UIApplication sharedApplication].keyWindow;
     if (!host || host.hidden || host.bounds.size.width <= host.bounds.size.height) {
         host = nil;
@@ -538,21 +588,37 @@ static void NJInstallMenu(void)
     }
     if (!host || host.bounds.size.width <= host.bounds.size.height) return;
 
+    UIView *hostView = host.rootViewController.view;
+    if (!hostView) hostView = host;
+    if (!hostView || hostView.bounds.size.width <= hostView.bounds.size.height) return;
+    gHostView = hostView;
+
     gController = [[NJMenuController alloc] initWithNibName:nil bundle:nil];
+    gController.hostView = hostView;
     UIView *menu = gController.view;
-    menu.frame = host.bounds;
+    menu.frame = hostView.bounds;
     menu.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    [host addSubview:menu];
-    [host bringSubviewToFront:menu];
+    [hostView addSubview:menu];
+    [hostView bringSubviewToFront:menu];
     [gController layoutMenu];
+
+    // The root view can still be between layout passes when we install; keep the
+    // positions correct even if its bounds change right after us.
+    [hostView addObserver:gController forKeyPath:@"bounds" options:NSKeyValueObservingOptionNew context:NULL];
+    for (NSNumber *delay in @[ @0.4, @1.2, @2.4 ]) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay.doubleValue * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            [gController layoutMenu];
+        });
+    }
 
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidChangeStatusBarOrientationNotification
                                                       object:nil
                                                        queue:[NSOperationQueue mainQueue]
                                                   usingBlock:^(NSNotification *note) {
-        UIWindow *w = [UIApplication sharedApplication].keyWindow;
-        if (w && gController) {
-            gController.view.frame = w.bounds;
+        UIView *h = gHostView;
+        if (h && gController) {
+            gController.view.frame = h.bounds;
             [gController layoutMenu];
         }
     }];
