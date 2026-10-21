@@ -9,7 +9,6 @@
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <mach/mach.h>
-#import <mach/mach_vm.h>
 #import <mach/vm_map.h>
 #import <mach-o/dyld.h>
 #import <libkern/OSCacheControl.h>
@@ -43,8 +42,8 @@ static BOOL vm_protect_span(void *addr, size_t len, vm_prot_t prot, BOOL copy)
 {
     vm_address_t page = (vm_address_t)addr & ~(vm_page_size - 1);
     vm_size_t span = ((vm_address_t)addr + len) - page;
-    kern_return_t kr = mach_vm_protect(mach_task_self(), page, span, FALSE,
-                                       (vm_prot_t)(prot | (copy ? VM_PROT_COPY : 0)));
+    kern_return_t kr = vm_protect(mach_task_self(), page, span, FALSE,
+                                  (vm_prot_t)(prot | (copy ? VM_PROT_COPY : 0)));
     return kr == KERN_SUCCESS;
 }
 
