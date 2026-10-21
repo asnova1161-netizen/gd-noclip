@@ -525,8 +525,18 @@ static NJMenuController *gController = nil;
 static void NJInstallMenu(void)
 {
     if (gController) return;
+
+    // Wait for the game's own landscape window; hosting the overlay there makes
+    // it inherit the exact bounds and keeps panning in the same coordinate space.
     UIWindow *host = [UIApplication sharedApplication].keyWindow;
-    if (!host) return;
+    if (!host || host.hidden || host.bounds.size.width <= host.bounds.size.height) {
+        host = nil;
+        for (UIWindow *w in [UIApplication sharedApplication].windows) {
+            if (w.hidden || w.alpha < 0.01) continue;
+            if (w.bounds.size.width > w.bounds.size.height) { host = w; break; }
+        }
+    }
+    if (!host || host.bounds.size.width <= host.bounds.size.height) return;
 
     gController = [[NJMenuController alloc] initWithNibName:nil bundle:nil];
     UIView *menu = gController.view;
