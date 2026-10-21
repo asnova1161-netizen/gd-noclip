@@ -63,7 +63,10 @@ static float NJSliderToSpeed(float value)
 {
     if (value < 0.0f) value = 0.0f;
     if (value > 1.0f) value = 1.0f;
-    return GD_SPEED_MIN * powf(GD_SPEED_MAX / GD_SPEED_MIN, value);
+    float speed = GD_SPEED_MIN * powf(GD_SPEED_MAX / GD_SPEED_MIN, value);
+    if (speed < GD_SPEED_MIN) speed = GD_SPEED_MIN;
+    if (speed > GD_SPEED_MAX) speed = GD_SPEED_MAX;
+    return speed;
 }
 
 static NSString *NJSpeedText(float speed)
