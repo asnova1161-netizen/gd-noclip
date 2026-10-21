@@ -113,17 +113,18 @@ static UILabel *NJLabel(NSString *text, CGFloat size, UIFontWeight weight, UICol
 }
 
 // ---------------------------------------------------------------------------
-// Pass-through window
+// Pass-through container (hosted inside the game's own window, so it inherits
+// the landscape bounds and never rotates independently)
 // ---------------------------------------------------------------------------
 
-@interface NJWindow : UIWindow
+@interface NJPassView : UIView
 @end
 
-@implementation NJWindow
+@implementation NJPassView
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event
 {
     UIView *hit = [super hitTest:point withEvent:event];
-    if (hit == self.rootViewController.view) return nil;
+    if (hit == self) return nil;   // empty area: let the game receive the touch
     return hit;
 }
 @end
@@ -149,16 +150,24 @@ static UILabel *NJLabel(NSString *text, CGFloat size, UIFontWeight weight, UICol
 @property (nonatomic, assign) BOOL panelVisible;
 @property (nonatomic, assign) BOOL draggingTrigger;
 @property (nonatomic, assign) BOOL draggingPanel;
+- (void)layoutMenu;
 @end
 
 @implementation NJMenuController
 
 @synthesize panelVisible = _panelVisible;
 
+- (void)loadView
+{
+    NJPassView *container = [[NJPassView alloc] initWithFrame:[UIScreen mainScreen].bounds];
+    container.backgroundColor = [UIColor clearColor];
+    container.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    self.view = container;
+}
+
 - (void)viewDidLoad
 {
     [super viewDidLoad];
-    self.view.backgroundColor = [UIColor clearColor];
     self.view.userInteractionEnabled = YES;
     [self buildTrigger];
     [self buildPanel];
@@ -176,6 +185,11 @@ static UILabel *NJLabel(NSString *text, CGFloat size, UIFontWeight weight, UICol
 - (void)viewDidLayoutSubviews
 {
     [super viewDidLayoutSubviews];
+    [self layoutMenu];
+}
+
+- (void)layoutMenu
+{
     CGRect bounds = self.view.bounds;
     CGFloat w = bounds.size.width;
     CGFloat h = bounds.size.height;
@@ -506,43 +520,32 @@ static UILabel *NJLabel(NSString *text, CGFloat size, UIFontWeight weight, UICol
 // Bootstrap
 // ---------------------------------------------------------------------------
 
-static NJWindow *gWindow = nil;
 static NJMenuController *gController = nil;
-
-static UIWindowScene *NJFindScene(void)
-{
-    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
-        if ([scene isKindOfClass:[UIWindowScene class]]) return (UIWindowScene *)scene;
-    }
-    return nil;
-}
-
-static BOOL NJSceneBased(void)
-{
-    id manifest = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"UIApplicationSceneManifest"];
-    return [manifest isKindOfClass:[NSDictionary class]];
-}
 
 static void NJInstallMenu(void)
 {
-    if (gWindow) return;
-    UIWindowScene *scene = NJFindScene();
-    if (!scene && NJSceneBased()) return; // scene-based app: wait until the scene connects
+    if (gController) return;
+    UIWindow *host = [UIApplication sharedApplication].keyWindow;
+    if (!host) return;
 
     gController = [[NJMenuController alloc] initWithNibName:nil bundle:nil];
-    if (scene) {
-        gWindow = [[NJWindow alloc] initWithWindowScene:scene];
-        gWindow.frame = scene.coordinateSpace.bounds;
-    } else {
-        // Legacy app (Geometry Dash has no UIApplicationSceneManifest).
-        UIWindow *host = [UIApplication sharedApplication].keyWindow;
-        CGRect frame = host ? host.bounds : [UIScreen mainScreen].bounds;
-        gWindow = [[NJWindow alloc] initWithFrame:frame];
-    }
-    gWindow.windowLevel = UIWindowLevelAlert + 100.0;
-    gWindow.backgroundColor = [UIColor clearColor];
-    gWindow.rootViewController = gController;
-    gWindow.hidden = NO;
+    UIView *menu = gController.view;
+    menu.frame = host.bounds;
+    menu.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    [host addSubview:menu];
+    [host bringSubviewToFront:menu];
+    [gController layoutMenu];
+
+    [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidChangeStatusBarOrientationNotification
+                                                      object:nil
+                                                       queue:[NSOperationQueue mainQueue]
+                                                  usingBlock:^(NSNotification *note) {
+        UIWindow *w = [UIApplication sharedApplication].keyWindow;
+        if (w && gController) {
+            gController.view.frame = w.bounds;
+            [gController layoutMenu];
+        }
+    }];
 }
 
 static void noclip_boot(void)
@@ -561,7 +564,7 @@ static void noclip_boot(void)
                 __block NSInteger tries = 0;
                 void (^tryInstall)(void) = ^{
                     NJInstallMenu();
-                    if (!gWindow && ++tries < 120) {
+                    if (!gController && ++tries < 120) {
                         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
                                        dispatch_get_main_queue(), tryInstall);
                     }
