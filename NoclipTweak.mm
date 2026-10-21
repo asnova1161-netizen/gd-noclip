@@ -24,17 +24,31 @@
 #define GD_VTABLE_OFF    0x79b0a0ULL
 #define GD_VTABLE_SLOT   159
 
+#define GD_UPDATE_OFF    0x202c74ULL
+#define GD_UPDATE_SLOT   5
+
 static BOOL        gEnabled = NO;
 static BOOL        gBinaryOK = NO;
 static uintptr_t   gImageBase = 0;
 static void       *gOrigDestroyPlayer = NULL;
+static void       *gOrigUpdate = NULL;
+static float       gSpeed = 1.0f;
 
 typedef void (*DestroyPlayerFn)(void *self, void *player, void *object);
+typedef void (*UpdateFn)(void *self, float dt);
 
 static void noclip_destroy_player(void *self, void *player, void *object)
 {
     if (gEnabled) return;           // noclip: swallow the death
     if (gOrigDestroyPlayer) ((DestroyPlayerFn)gOrigDestroyPlayer)(self, player, object);
+}
+
+static void noclip_update(void *self, float dt)
+{
+    if (!gOrigUpdate) return;
+    float scale = gSpeed;
+    if (scale < 0.1f || scale > 10.0f) scale = 1.0f;
+    ((UpdateFn)gOrigUpdate)(self, dt * scale);
 }
 
 static BOOL vm_protect_span(void *addr, size_t len, vm_prot_t prot, BOOL copy)
@@ -55,6 +69,9 @@ static void gd_probe(void)
     void **slot = (void **)(gImageBase + GD_VTABLE_OFF + GD_VTABLE_SLOT * 8);
     if (*slot != (void *)fn) return;
 
+    void **updateSlot = (void **)(gImageBase + GD_VTABLE_OFF + GD_UPDATE_SLOT * 8);
+    if (*updateSlot != (void *)(gImageBase + GD_UPDATE_OFF)) return;
+
     const unsigned char expect[4] = { 0xff, 0x43, 0x03, 0xd1 }; // sub sp, sp, #0xd0
     if (memcmp((void *)fn, expect, 4) != 0) return;
 
@@ -73,6 +90,18 @@ static BOOL gd_install_vtable_hook(void)
     return YES;
 }
 
+static BOOL gd_install_update_hook(void)
+{
+    if (!gBinaryOK) return NO;
+    void **slot = (void **)(gImageBase + GD_VTABLE_OFF + GD_UPDATE_SLOT * 8);
+    if (*slot == (void *)&noclip_update) return YES;
+    if (*slot != (void *)(gImageBase + GD_UPDATE_OFF)) return NO;
+    if (!vm_protect_span(slot, sizeof(void *), VM_PROT_READ | VM_PROT_WRITE, NO)) return NO;
+    gOrigUpdate = *slot;
+    *slot = (void *)&noclip_update;
+    return YES;
+}
+
 static void noclip_set_enabled(BOOL on)
 {
     gEnabled = on;
@@ -86,11 +115,9 @@ static void noclip_set_enabled(BOOL on)
 
 static UIColor *NJAccent(void)   { return [UIColor colorWithRed:1.00 green:0.10 blue:0.10 alpha:1.0]; }
 static UIColor *NJPanel(void)    { return [UIColor colorWithWhite:0.075 alpha:0.97]; }
-static UIColor *NJCard(void)     { return [UIColor colorWithWhite:0.115 alpha:1.0]; }
 static UIColor *NJLine(void)     { return [UIColor colorWithWhite:1.0 alpha:0.10]; }
 static UIColor *NJText(void)     { return [UIColor colorWithWhite:1.0 alpha:1.0]; }
 static UIColor *NJDim(void)      { return [UIColor colorWithWhite:1.0 alpha:0.42]; }
-static UIColor *NJFaint(void)    { return [UIColor colorWithWhite:1.0 alpha:0.28]; }
 
 static UILabel *NJLabel(NSString *text, CGFloat size, UIFontWeight weight, UIColor *color, CGFloat kern)
 {
@@ -149,15 +176,9 @@ static UILabel *NJLabel(NSString *text, CGFloat size, UIFontWeight weight, UICol
 @property (nonatomic, strong) UILabel *triggerLabel;
 @property (nonatomic, strong) UIView *panel;
 @property (nonatomic, strong) UIView *panelHeader;
-@property (nonatomic, strong) UIView *sidebar;
-@property (nonatomic, strong) UIView *content;
-@property (nonatomic, strong) UIView *indicator;
-@property (nonatomic, strong) UIButton *tabNoclip;
-@property (nonatomic, strong) UIButton *tabMisc;
-@property (nonatomic, strong) UIView *pageNoclip;
-@property (nonatomic, strong) UIView *pageMisc;
 @property (nonatomic, strong) UISwitch *toggle;
-@property (nonatomic, assign) NSInteger tab;
+@property (nonatomic, strong) UISlider *speedSlider;
+@property (nonatomic, strong) UILabel *speedValue;
 @property (nonatomic, assign) BOOL panelVisible;
 @property (nonatomic, assign) BOOL draggingTrigger;
 @property (nonatomic, assign) BOOL draggingPanel;
@@ -184,7 +205,6 @@ static UILabel *NJLabel(NSString *text, CGFloat size, UIFontWeight weight, UICol
     self.view.userInteractionEnabled = YES;
     [self buildTrigger];
     [self buildPanel];
-    [self selectTab:0];
     self.panel.alpha = 0.0;
     self.panel.hidden = YES;
     self.panelVisible = NO;
@@ -273,8 +293,8 @@ static UILabel *NJLabel(NSString *text, CGFloat size, UIFontWeight weight, UICol
 
 - (void)buildPanel
 {
-    CGFloat pw = 332.0;
-    CGFloat ph = 208.0;
+    CGFloat pw = 300.0;
+    CGFloat ph = 156.0;
     self.panel = [[UIView alloc] initWithFrame:CGRectMake(0, 0, pw, ph)];
     self.panel.backgroundColor = NJPanel();
     self.panel.layer.cornerRadius = 16.0;
@@ -282,23 +302,18 @@ static UILabel *NJLabel(NSString *text, CGFloat size, UIFontWeight weight, UICol
     self.panel.layer.borderColor = NJLine().CGColor;
     self.panel.userInteractionEnabled = YES;
 
-    // Header
-    self.panelHeader = [[UIView alloc] initWithFrame:CGRectMake(0, 0, pw, 50)];
+    // Header (also the drag handle)
+    self.panelHeader = [[UIView alloc] initWithFrame:CGRectMake(0, 0, pw, 44)];
     self.panelHeader.backgroundColor = [UIColor clearColor];
     [self.panel addSubview:self.panelHeader];
 
-    UILabel *title = NJLabel(@"noclip", 14.0, UIFontWeightHeavy, NJText(), 0.6);
+    UILabel *title = NJLabel(@"NOCLIP", 13.0, UIFontWeightHeavy, NJText(), 1.4);
     title.textAlignment = NSTextAlignmentCenter;
-    title.frame = CGRectMake(0, 12, pw, 18);
+    title.frame = CGRectMake(0, 13, pw, 18);
     [self.panelHeader addSubview:title];
 
-    UILabel *sub = NJLabel(@"geometry dash 2.205", 8.0, UIFontWeightMedium, NJFaint(), 1.1);
-    sub.textAlignment = NSTextAlignmentCenter;
-    sub.frame = CGRectMake(0, 31, pw, 11);
-    [self.panelHeader addSubview:sub];
-
     UIButton *close = [UIButton buttonWithType:UIButtonTypeSystem];
-    close.frame = CGRectMake(pw - 40, 8, 32, 32);
+    close.frame = CGRectMake(pw - 38, 6, 32, 32);
     close.titleLabel.font = [UIFont systemFontOfSize:18 weight:UIFontWeightSemibold];
     [close setTitle:@"\u00d7" forState:UIControlStateNormal];
     [close setTitleColor:NJDim() forState:UIControlStateNormal];
@@ -312,131 +327,48 @@ static UILabel *NJLabel(NSString *text, CGFloat size, UIFontWeight weight, UICol
     pan.maximumNumberOfTouches = 1;
     [self.panelHeader addGestureRecognizer:pan];
 
-    // Sidebar (vertical tab rail, Ascent style)
-    self.sidebar = [[UIView alloc] initWithFrame:CGRectMake(10, 56, 82, ph - 68)];
-    self.sidebar.backgroundColor = NJCard();
-    self.sidebar.layer.cornerRadius = 10.0;
-    [self.panel addSubview:self.sidebar];
+    UIView *line1 = [[UIView alloc] initWithFrame:CGRectMake(16, 44, pw - 32, 1)];
+    line1.backgroundColor = NJLine();
+    [self.panel addSubview:line1];
 
-    self.tabNoclip = [self makeTab:@"Noclip" tag:0];
-    self.tabMisc   = [self makeTab:@"Misc"   tag:1];
-    [self.sidebar addSubview:self.tabNoclip];
-    [self.sidebar addSubview:self.tabMisc];
+    // Noclip row
+    UILabel *noclipLabel = NJLabel(@"Noclip", 13.0, UIFontWeightSemibold, NJText(), 0.0);
+    noclipLabel.frame = CGRectMake(16, 58, 120, 18);
+    [self.panel addSubview:noclipLabel];
 
-    self.indicator = [[UIView alloc] initWithFrame:CGRectZero];
-    self.indicator.backgroundColor = NJAccent();
-    self.indicator.layer.cornerRadius = 1.5;
-    [self.sidebar addSubview:self.indicator];
-
-    // Content card
-    self.content = [[UIView alloc] initWithFrame:CGRectMake(100, 56, pw - 110, ph - 68)];
-    self.content.backgroundColor = NJCard();
-    self.content.layer.cornerRadius = 10.0;
-    [self.panel addSubview:self.content];
-
-    [self buildNoclipPage];
-    [self buildMiscPage];
-
-    [self.view addSubview:self.panel];
-}
-
-- (UIButton *)makeTab:(NSString *)text tag:(NSInteger)tag
-{
-    UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
-    button.frame = CGRectMake(0, 8 + tag * 34, 82, 30);
-    button.tag = 200 + tag;
-    button.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
-    button.titleEdgeInsets = UIEdgeInsetsMake(0, 14, 0, 0);
-    button.titleLabel.font = [UIFont systemFontOfSize:12.0 weight:UIFontWeightSemibold];
-    [button setTitle:text forState:UIControlStateNormal];
-    [button addTarget:self action:@selector(tabTapped:) forControlEvents:UIControlEventTouchUpInside];
-    return button;
-}
-
-- (void)buildNoclipPage
-{
-    self.pageNoclip = [[UIView alloc] initWithFrame:self.content.bounds];
-    self.pageNoclip.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    [self.content addSubview:self.pageNoclip];
-
-    UILabel *title = NJLabel(@"Enable", 14.0, UIFontWeightSemibold, NJText(), 0.0);
-    title.frame = CGRectMake(14, 15, 150, 18);
-    [self.pageNoclip addSubview:title];
-
-    UILabel *sub = NJLabel(@"pass through obstacles and spikes", 9.5, UIFontWeightRegular, NJDim(), 0.1);
-    sub.frame = CGRectMake(14, 35, 160, 13);
-    [self.pageNoclip addSubview:sub];
-
-    self.toggle = [[UISwitch alloc] initWithFrame:CGRectMake(self.content.bounds.size.width - 65, 16, 51, 31)];
+    self.toggle = [[UISwitch alloc] initWithFrame:CGRectMake(pw - 67, 52, 51, 31)];
     self.toggle.onTintColor = NJAccent();
     self.toggle.thumbTintColor = [UIColor whiteColor];
     self.toggle.on = gEnabled;
     [self.toggle addTarget:self action:@selector(toggleChanged:) forControlEvents:UIControlEventValueChanged];
-    self.toggle.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
-    [self.pageNoclip addSubview:self.toggle];
+    [self.panel addSubview:self.toggle];
 
-    UIView *line = [[UIView alloc] initWithFrame:CGRectMake(14, 62, self.content.bounds.size.width - 28, 1)];
-    line.backgroundColor = NJLine();
-    line.autoresizingMask = UIViewAutoresizingFlexibleWidth;
-    [self.pageNoclip addSubview:line];
+    UIView *line2 = [[UIView alloc] initWithFrame:CGRectMake(16, 91, pw - 32, 1)];
+    line2.backgroundColor = NJLine();
+    [self.panel addSubview:line2];
 
-    UILabel *note = NJLabel(@"the player no longer dies on impact", 9.5, UIFontWeightRegular, NJFaint(), 0.0);
-    note.frame = CGRectMake(14, 74, self.content.bounds.size.width - 28, 13);
-    note.autoresizingMask = UIViewAutoresizingFlexibleWidth;
-    [self.pageNoclip addSubview:note];
-}
+    // Speed row
+    UILabel *speedLabel = NJLabel(@"Speed", 13.0, UIFontWeightSemibold, NJText(), 0.0);
+    speedLabel.frame = CGRectMake(16, 104, 60, 18);
+    [self.panel addSubview:speedLabel];
 
-- (void)buildMiscPage
-{
-    self.pageMisc = [[UIView alloc] initWithFrame:self.content.bounds];
-    self.pageMisc.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    self.pageMisc.hidden = YES;
-    [self.content addSubview:self.pageMisc];
+    self.speedSlider = [[UISlider alloc] initWithFrame:CGRectMake(78, 97, 140, 31)];
+    self.speedSlider.minimumValue = 0.5f;
+    self.speedSlider.maximumValue = 2.0f;
+    self.speedSlider.value = gSpeed;
+    self.speedSlider.minimumTrackTintColor = NJAccent();
+    self.speedSlider.maximumTrackTintColor = [UIColor colorWithWhite:1.0 alpha:0.12];
+    self.speedSlider.thumbTintColor = [UIColor whiteColor];
+    self.speedSlider.continuous = YES;
+    [self.speedSlider addTarget:self action:@selector(speedChanged:) forControlEvents:UIControlEventValueChanged];
+    [self.panel addSubview:self.speedSlider];
 
-    UILabel *title = NJLabel(@"Reset position", 14.0, UIFontWeightSemibold, NJText(), 0.0);
-    title.frame = CGRectMake(14, 15, 170, 18);
-    [self.pageMisc addSubview:title];
+    self.speedValue = NJLabel([NSString stringWithFormat:@"%.1f\u00d7", gSpeed], 12.0, UIFontWeightSemibold, NJText(), 0.0);
+    self.speedValue.textAlignment = NSTextAlignmentRight;
+    self.speedValue.frame = CGRectMake(pw - 72, 104, 56, 18);
+    [self.panel addSubview:self.speedValue];
 
-    UILabel *sub = NJLabel(@"move the button back to the edge", 9.5, UIFontWeightRegular, NJDim(), 0.1);
-    sub.frame = CGRectMake(14, 35, 180, 13);
-    [self.pageMisc addSubview:sub];
-
-    UIButton *reset = [UIButton buttonWithType:UIButtonTypeSystem];
-    reset.frame = CGRectMake(14, 60, 120, 30);
-    reset.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.06];
-    reset.layer.cornerRadius = 8.0;
-    [reset setTitle:@"Reset" forState:UIControlStateNormal];
-    [reset setTitleColor:NJText() forState:UIControlStateNormal];
-    reset.titleLabel.font = [UIFont systemFontOfSize:11.0 weight:UIFontWeightSemibold];
-    [reset addTarget:self action:@selector(resetTapped:) forControlEvents:UIControlEventTouchUpInside];
-    [self.pageMisc addSubview:reset];
-
-    UIView *line = [[UIView alloc] initWithFrame:CGRectMake(14, 100, self.content.bounds.size.width - 28, 1)];
-    line.backgroundColor = NJLine();
-    [self.pageMisc addSubview:line];
-
-    UILabel *hint = NJLabel(@"drag the N button anywhere", 9.5, UIFontWeightRegular, NJFaint(), 0.0);
-    hint.frame = CGRectMake(14, 110, self.content.bounds.size.width - 28, 13);
-    [self.pageMisc addSubview:hint];
-}
-
-- (void)selectTab:(NSInteger)tab
-{
-    self.tab = tab;
-    BOOL noclip = (tab == 0);
-    self.pageNoclip.hidden = !noclip;
-    self.pageMisc.hidden = noclip;
-    [self.tabNoclip setTitleColor:(noclip ? NJText() : NJDim()) forState:UIControlStateNormal];
-    [self.tabMisc setTitleColor:(noclip ? NJDim() : NJText()) forState:UIControlStateNormal];
-    [self.sidebar bringSubviewToFront:self.indicator];
-    [UIView animateWithDuration:0.16 animations:^{
-        self.indicator.frame = CGRectMake(3, (noclip ? 8 : 42) + 6, 3, 18);
-    }];
-}
-
-- (void)tabTapped:(UIButton *)sender
-{
-    [self selectTab:sender.tag - 200];
+    [self.view addSubview:self.panel];
 }
 
 - (void)toggleChanged:(UISwitch *)sender
@@ -444,13 +376,16 @@ static UILabel *NJLabel(NSString *text, CGFloat size, UIFontWeight weight, UICol
     noclip_set_enabled(sender.isOn);
 }
 
-- (void)resetTapped:(id)sender
+- (void)speedChanged:(UISlider *)sender
 {
-    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
-    [d setDouble:0.93 forKey:@"noclip.bx"];
-    [d setDouble:0.50 forKey:@"noclip.by"];
-    CGRect b = self.view.bounds;
-    self.trigger.center = [self clampTrigger:CGPointMake(b.size.width * 0.93, b.size.height * 0.50) inBounds:b];
+    float value = sender.value;
+    if (value > 0.94f && value < 1.06f) {
+        value = 1.0f;
+        sender.value = 1.0f;
+    }
+    gSpeed = value;
+    self.speedValue.text = [NSString stringWithFormat:@"%.1f\u00d7", value];
+    [[NSUserDefaults standardUserDefaults] setFloat:value forKey:@"noclip.speed"];
 }
 
 - (void)closeTapped:(id)sender
@@ -628,11 +563,15 @@ static void noclip_boot(void)
         @autoreleasepool {
             gImageBase = (uintptr_t)_dyld_get_image_header(0);
             gEnabled = [[NSUserDefaults standardUserDefaults] boolForKey:@"noclip.enabled"];
+            gSpeed = [[NSUserDefaults standardUserDefaults] floatForKey:@"noclip.speed"];
+            if (gSpeed < 0.5f || gSpeed > 2.0f) gSpeed = 1.0f;
 
             dispatch_async(dispatch_get_main_queue(), ^{
                 gd_probe();
                 BOOL hooked = gd_install_vtable_hook();
-                NSLog(@"[noclip] probe=%d vtableHook=%d enabled=%d", gBinaryOK, hooked, gEnabled);
+                BOOL speedHooked = gd_install_update_hook();
+                NSLog(@"[noclip] probe=%d vtableHook=%d speedHook=%d enabled=%d speed=%.2f",
+                      gBinaryOK, hooked, speedHooked, gEnabled, gSpeed);
 
                 __block NSInteger tries = 0;
                 void (^tryInstall)(void) = ^{
