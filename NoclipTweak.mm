@@ -78,6 +78,7 @@ static NSString *NJSpeedText(float speed)
 static void noclip_destroy_player(void *self, void *player, void *object)
 {
     if (gEnabled) return;           // noclip: swallow the death
+    if (gResetting) return;         // ignore deaths caused by our own reset
 
     // Detect whether this is a fresh death. If the player is already dead (or
     // the layer is already in its death sequence), this call is a replay of an
