@@ -27,24 +27,54 @@
 #define GD_UPDATE_OFF    0x202c74ULL
 #define GD_UPDATE_SLOT   5
 
+#define GD_RESET_OFF     0x11a550ULL
+#define GD_RESTART_FLAG  0x367e
+
 static BOOL        gEnabled = NO;
+static BOOL        gAutoRestart = NO;
 static BOOL        gBinaryOK = NO;
+static BOOL        gResetOK = NO;
+static BOOL        gResetRequested = NO;
+static BOOL        gInReset = NO;
 static uintptr_t   gImageBase = 0;
 static void       *gOrigDestroyPlayer = NULL;
 static void       *gOrigUpdate = NULL;
+static void       *gResetLayer = NULL;
 static float       gSpeed = 1.0f;
 
 typedef void (*DestroyPlayerFn)(void *self, void *player, void *object);
 typedef void (*UpdateFn)(void *self, float dt);
+typedef void (*ResetLevelFn)(void *self);
 
 static void noclip_destroy_player(void *self, void *player, void *object)
 {
     if (gEnabled) return;           // noclip: swallow the death
     if (gOrigDestroyPlayer) ((DestroyPlayerFn)gOrigDestroyPlayer)(self, player, object);
+    if (gAutoRestart && gResetOK) {
+        gResetLayer = self;
+        gResetRequested = YES;
+    }
 }
 
 static void noclip_update(void *self, float dt)
 {
+    if (gInReset) return;
+
+    if (gResetRequested) {
+        void *layer = gResetLayer;
+        gResetRequested = NO;
+        gResetLayer = NULL;
+        if (layer == self && gAutoRestart && gResetOK) {
+            // Kill the game's delayed death-action callback, then reset right
+            // at the start of the next frame so the game is not mid-iteration.
+            *((uint8_t *)self + GD_RESTART_FLAG) = 0;
+            gInReset = YES;
+            ((ResetLevelFn)(gImageBase + GD_RESET_OFF))(self);
+            gInReset = NO;
+            return;
+        }
+    }
+
     if (!gOrigUpdate) return;
     float scale = gSpeed;
     if (scale < 0.1f || scale > 10.0f) scale = 1.0f;
@@ -77,6 +107,7 @@ static void gd_probe(void)
 
     gOrigDestroyPlayer = (void *)fn;
     gBinaryOK = YES;
+    gResetOK = (*(uint32_t *)(gImageBase + GD_RESET_OFF) == 0xd10303ff); // sub sp, sp, #0xc0
 }
 
 static BOOL gd_install_vtable_hook(void)
@@ -177,6 +208,7 @@ static UILabel *NJLabel(NSString *text, CGFloat size, UIFontWeight weight, UICol
 @property (nonatomic, strong) UIView *panel;
 @property (nonatomic, strong) UIView *panelHeader;
 @property (nonatomic, strong) UISwitch *toggle;
+@property (nonatomic, strong) UISwitch *restartToggle;
 @property (nonatomic, strong) UISlider *speedSlider;
 @property (nonatomic, strong) UILabel *speedValue;
 @property (nonatomic, assign) BOOL panelVisible;
@@ -294,7 +326,7 @@ static UILabel *NJLabel(NSString *text, CGFloat size, UIFontWeight weight, UICol
 - (void)buildPanel
 {
     CGFloat pw = 300.0;
-    CGFloat ph = 156.0;
+    CGFloat ph = 180.0;
     self.panel = [[UIView alloc] initWithFrame:CGRectMake(0, 0, pw, ph)];
     self.panel.backgroundColor = NJPanel();
     self.panel.layer.cornerRadius = 16.0;
@@ -333,26 +365,26 @@ static UILabel *NJLabel(NSString *text, CGFloat size, UIFontWeight weight, UICol
 
     // Noclip row
     UILabel *noclipLabel = NJLabel(@"Noclip", 13.0, UIFontWeightSemibold, NJText(), 0.0);
-    noclipLabel.frame = CGRectMake(16, 58, 120, 18);
+    noclipLabel.frame = CGRectMake(16, 56, 120, 18);
     [self.panel addSubview:noclipLabel];
 
-    self.toggle = [[UISwitch alloc] initWithFrame:CGRectMake(pw - 67, 52, 51, 31)];
+    self.toggle = [[UISwitch alloc] initWithFrame:CGRectMake(pw - 67, 50, 51, 31)];
     self.toggle.onTintColor = NJAccent();
     self.toggle.thumbTintColor = [UIColor whiteColor];
     self.toggle.on = gEnabled;
     [self.toggle addTarget:self action:@selector(toggleChanged:) forControlEvents:UIControlEventValueChanged];
     [self.panel addSubview:self.toggle];
 
-    UIView *line2 = [[UIView alloc] initWithFrame:CGRectMake(16, 91, pw - 32, 1)];
+    UIView *line2 = [[UIView alloc] initWithFrame:CGRectMake(16, 86, pw - 32, 1)];
     line2.backgroundColor = NJLine();
     [self.panel addSubview:line2];
 
     // Speed row
     UILabel *speedLabel = NJLabel(@"Speed", 13.0, UIFontWeightSemibold, NJText(), 0.0);
-    speedLabel.frame = CGRectMake(16, 104, 60, 18);
+    speedLabel.frame = CGRectMake(16, 98, 60, 18);
     [self.panel addSubview:speedLabel];
 
-    self.speedSlider = [[UISlider alloc] initWithFrame:CGRectMake(78, 97, 140, 31)];
+    self.speedSlider = [[UISlider alloc] initWithFrame:CGRectMake(78, 91, 140, 31)];
     self.speedSlider.minimumValue = 0.5f;
     self.speedSlider.maximumValue = 2.0f;
     self.speedSlider.value = gSpeed;
@@ -365,8 +397,24 @@ static UILabel *NJLabel(NSString *text, CGFloat size, UIFontWeight weight, UICol
 
     self.speedValue = NJLabel([NSString stringWithFormat:@"%.1f\u00d7", gSpeed], 12.0, UIFontWeightSemibold, NJText(), 0.0);
     self.speedValue.textAlignment = NSTextAlignmentRight;
-    self.speedValue.frame = CGRectMake(pw - 72, 104, 56, 18);
+    self.speedValue.frame = CGRectMake(pw - 72, 98, 56, 18);
     [self.panel addSubview:self.speedValue];
+
+    UIView *line3 = [[UIView alloc] initWithFrame:CGRectMake(16, 128, pw - 32, 1)];
+    line3.backgroundColor = NJLine();
+    [self.panel addSubview:line3];
+
+    // Instant restart row
+    UILabel *restartLabel = NJLabel(@"Instant Restart", 13.0, UIFontWeightSemibold, NJText(), 0.0);
+    restartLabel.frame = CGRectMake(16, 140, 180, 18);
+    [self.panel addSubview:restartLabel];
+
+    self.restartToggle = [[UISwitch alloc] initWithFrame:CGRectMake(pw - 67, 134, 51, 31)];
+    self.restartToggle.onTintColor = NJAccent();
+    self.restartToggle.thumbTintColor = [UIColor whiteColor];
+    self.restartToggle.on = gAutoRestart;
+    [self.restartToggle addTarget:self action:@selector(restartChanged:) forControlEvents:UIControlEventValueChanged];
+    [self.panel addSubview:self.restartToggle];
 
     [self.view addSubview:self.panel];
 }
@@ -386,6 +434,16 @@ static UILabel *NJLabel(NSString *text, CGFloat size, UIFontWeight weight, UICol
     gSpeed = value;
     self.speedValue.text = [NSString stringWithFormat:@"%.1f\u00d7", value];
     [[NSUserDefaults standardUserDefaults] setFloat:value forKey:@"noclip.speed"];
+}
+
+- (void)restartChanged:(UISwitch *)sender
+{
+    gAutoRestart = sender.isOn;
+    if (!gAutoRestart) {
+        gResetRequested = NO;
+        gResetLayer = NULL;
+    }
+    [[NSUserDefaults standardUserDefaults] setBool:gAutoRestart forKey:@"noclip.instantRestart"];
 }
 
 - (void)closeTapped:(id)sender
@@ -563,6 +621,7 @@ static void noclip_boot(void)
         @autoreleasepool {
             gImageBase = (uintptr_t)_dyld_get_image_header(0);
             gEnabled = [[NSUserDefaults standardUserDefaults] boolForKey:@"noclip.enabled"];
+            gAutoRestart = [[NSUserDefaults standardUserDefaults] boolForKey:@"noclip.instantRestart"];
             gSpeed = [[NSUserDefaults standardUserDefaults] floatForKey:@"noclip.speed"];
             if (gSpeed < 0.5f || gSpeed > 2.0f) gSpeed = 1.0f;
 
@@ -570,8 +629,8 @@ static void noclip_boot(void)
                 gd_probe();
                 BOOL hooked = gd_install_vtable_hook();
                 BOOL speedHooked = gd_install_update_hook();
-                NSLog(@"[noclip] probe=%d vtableHook=%d speedHook=%d enabled=%d speed=%.2f",
-                      gBinaryOK, hooked, speedHooked, gEnabled, gSpeed);
+                NSLog(@"[noclip] probe=%d vtableHook=%d speedHook=%d reset=%d enabled=%d restart=%d speed=%.2f",
+                      gBinaryOK, hooked, speedHooked, gResetOK, gEnabled, gAutoRestart, gSpeed);
 
                 __block NSInteger tries = 0;
                 void (^tryInstall)(void) = ^{
