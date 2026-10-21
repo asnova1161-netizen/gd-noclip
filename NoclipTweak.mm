@@ -280,8 +280,6 @@ static UILabel *NJLabel(NSString *text, CGFloat size, UIFontWeight weight, UICol
     self.panel.layer.cornerRadius = 16.0;
     self.panel.layer.borderWidth = 1.0;
     self.panel.layer.borderColor = NJLine().CGColor;
-    self.panel.layer.shouldRasterize = YES;
-    self.panel.layer.rasterizationScale = [UIScreen mainScreen].scale;
     self.panel.userInteractionEnabled = YES;
 
     // Header
@@ -334,7 +332,6 @@ static UILabel *NJLabel(NSString *text, CGFloat size, UIFontWeight weight, UICol
     self.content = [[UIView alloc] initWithFrame:CGRectMake(100, 56, pw - 110, ph - 68)];
     self.content.backgroundColor = NJCard();
     self.content.layer.cornerRadius = 10.0;
-    self.content.clipsToBounds = YES;
     [self.panel addSubview:self.content];
 
     [self buildNoclipPage];
