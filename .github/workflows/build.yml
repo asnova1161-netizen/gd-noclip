@@ -24,6 +24,7 @@ jobs:
             -dynamiclib \
             -install_name @executable_path/Noclip.dylib \
             -framework UIKit -framework Foundation \
+            -framework QuartzCore -framework CoreGraphics \
             -o Noclip.dylib NoclipTweak.mm
           file Noclip.dylib
           otool -hv Noclip.dylib | head -n 6
