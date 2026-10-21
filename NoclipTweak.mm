@@ -34,12 +34,9 @@ static BOOL        gEnabled = NO;
 static BOOL        gAutoRestart = NO;
 static BOOL        gBinaryOK = NO;
 static BOOL        gResetOK = NO;
-static BOOL        gResetRequested = NO;
-static BOOL        gInReset = NO;
 static uintptr_t   gImageBase = 0;
 static void       *gOrigDestroyPlayer = NULL;
 static void       *gOrigUpdate = NULL;
-static void       *gResetLayer = NULL;
 static float       gSpeed = 1.0f;
 
 typedef void (*DestroyPlayerFn)(void *self, void *player, void *object);
@@ -50,31 +47,22 @@ static void noclip_destroy_player(void *self, void *player, void *object)
 {
     if (gEnabled) return;           // noclip: swallow the death
     if (gOrigDestroyPlayer) ((DestroyPlayerFn)gOrigDestroyPlayer)(self, player, object);
-    if (gAutoRestart && gResetOK && !gInReset) {
-        gResetLayer = self;
-        gResetRequested = YES;
+
+    if (gAutoRestart && gResetOK) {
+        // Run the reset on the next main-queue turn. The death function has
+        // already returned by then, so it is safe to tear down the level, and
+        // it does not wait for the death animation or any game update.
+        void *layer = self;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (!gAutoRestart || !gResetOK) return;
+            *((uint8_t *)layer + GD_RESTART_FLAG) = 0; // cancel delayed auto-restart
+            ((ResetLevelFn)(gImageBase + GD_RESET_OFF))(layer);
+        });
     }
 }
 
 static void noclip_update(void *self, float dt)
 {
-    if (gInReset) return;
-
-    if (gResetRequested) {
-        void *layer = gResetLayer;
-        gResetRequested = NO;
-        gResetLayer = NULL;
-        if (layer == self && gAutoRestart && gResetOK) {
-            // Kill the game's delayed death-action callback, then reset right
-            // at the start of the next frame so the game is not mid-iteration.
-            *((uint8_t *)self + GD_RESTART_FLAG) = 0;
-            gInReset = YES;
-            ((ResetLevelFn)(gImageBase + GD_RESET_OFF))(self);
-            gInReset = NO;
-            return;
-        }
-    }
-
     if (!gOrigUpdate) return;
     float scale = gSpeed;
     if (scale < 0.1f || scale > 10.0f) scale = 1.0f;
@@ -385,8 +373,8 @@ static UILabel *NJLabel(NSString *text, CGFloat size, UIFontWeight weight, UICol
     [self.panel addSubview:speedLabel];
 
     self.speedSlider = [[UISlider alloc] initWithFrame:CGRectMake(78, 91, 140, 31)];
-    self.speedSlider.minimumValue = 0.5f;
-    self.speedSlider.maximumValue = 2.0f;
+    self.speedSlider.minimumValue = 0.1f;
+    self.speedSlider.maximumValue = 4.0f;
     self.speedSlider.value = gSpeed;
     self.speedSlider.minimumTrackTintColor = NJAccent();
     self.speedSlider.maximumTrackTintColor = [UIColor colorWithWhite:1.0 alpha:0.12];
@@ -439,10 +427,6 @@ static UILabel *NJLabel(NSString *text, CGFloat size, UIFontWeight weight, UICol
 - (void)restartChanged:(UISwitch *)sender
 {
     gAutoRestart = sender.isOn;
-    if (!gAutoRestart) {
-        gResetRequested = NO;
-        gResetLayer = NULL;
-    }
     [[NSUserDefaults standardUserDefaults] setBool:gAutoRestart forKey:@"noclip.instantRestart"];
 }
 
@@ -623,7 +607,9 @@ static void noclip_boot(void)
             gEnabled = [[NSUserDefaults standardUserDefaults] boolForKey:@"noclip.enabled"];
             gAutoRestart = [[NSUserDefaults standardUserDefaults] boolForKey:@"noclip.instantRestart"];
             gSpeed = [[NSUserDefaults standardUserDefaults] floatForKey:@"noclip.speed"];
-            if (gSpeed < 0.5f || gSpeed > 2.0f) gSpeed = 1.0f;
+            if (gSpeed <= 0.0f) gSpeed = 1.0f;
+            if (gSpeed < 0.1f) gSpeed = 0.1f;
+            if (gSpeed > 4.0f) gSpeed = 4.0f;
 
             dispatch_async(dispatch_get_main_queue(), ^{
                 gd_probe();
