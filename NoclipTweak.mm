@@ -27,15 +27,18 @@
 static BOOL        gEnabled = NO;
 static BOOL        gPatched = NO;
 static BOOL        gHaveOrig = NO;
+static BOOL        gBinaryOK = NO;
 static uintptr_t   gImageBase = 0;
+static void       *gOrigDestroyPlayer = NULL;
 static unsigned char gOrigCode[16];
 
 typedef void (*DestroyPlayerFn)(void *self, void *player, void *object);
 
 static void noclip_destroy_player(void *self, void *player, void *object)
 {
-    (void)self; (void)player; (void)object;
-    // Death swallowed: player keeps going through the obstacle.
+    if (gEnabled) return;           // noclip: swallow the death
+    if (gPatched) return;           // inline patch is live, calling the original would recurse
+    if (gOrigDestroyPlayer) ((DestroyPlayerFn)gOrigDestroyPlayer)(self, player, object);
 }
 
 static BOOL vm_protect_span(void *addr, size_t len, vm_prot_t prot, BOOL copy)
@@ -47,19 +50,36 @@ static BOOL vm_protect_span(void *addr, size_t len, vm_prot_t prot, BOOL copy)
     return kr == KERN_SUCCESS;
 }
 
-static BOOL gd_binary_matches(void)
+static void gd_probe(void)
 {
-    if (!gImageBase) return NO;
+    gImageBase = (uintptr_t)_dyld_get_image_header(0);
+    if (!gImageBase) return;
+
     uintptr_t fn = gImageBase + GD_DESTROY_OFF;
-    uintptr_t vt = gImageBase + GD_VTABLE_OFF;
-    void *slot = *(void **)(vt + GD_VTABLE_SLOT * 8);
+    void **slot = (void **)(gImageBase + GD_VTABLE_OFF + GD_VTABLE_SLOT * 8);
+    if (*slot != (void *)fn) return;
+
     const unsigned char expect[4] = { 0xff, 0x43, 0x03, 0xd1 }; // sub sp, sp, #0xd0
-    return slot == (void *)fn && memcmp((void *)fn, expect, 4) == 0;
+    if (memcmp((void *)fn, expect, 4) != 0) return;
+
+    gOrigDestroyPlayer = (void *)fn;
+    gBinaryOK = YES;
+}
+
+static BOOL gd_install_vtable_hook(void)
+{
+    if (!gBinaryOK) return NO;
+    void **slot = (void **)(gImageBase + GD_VTABLE_OFF + GD_VTABLE_SLOT * 8);
+    if (*slot == (void *)&noclip_destroy_player) return YES;
+    if (*slot != gOrigDestroyPlayer) return NO;
+    if (!vm_protect_span(slot, sizeof(void *), VM_PROT_READ | VM_PROT_WRITE, NO)) return NO;
+    *slot = (void *)&noclip_destroy_player;
+    return YES;
 }
 
 static BOOL gd_patch_on(void)
 {
-    if (gPatched || !gd_binary_matches()) return NO;
+    if (gPatched || !gBinaryOK) return NO;
 
     uintptr_t fn = gImageBase + GD_DESTROY_OFF;
     if (!gHaveOrig) {
@@ -97,7 +117,8 @@ static void gd_patch_off(void)
 static void noclip_set_enabled(BOOL on)
 {
     gEnabled = on;
-    if (on) gd_patch_on(); else gd_patch_off();
+    BOOL patched = on ? gd_patch_on() : (gd_patch_off(), NO);
+    NSLog(@"[noclip] enabled=%d codePatched=%d", on, patched);
     [[NSUserDefaults standardUserDefaults] setBool:on forKey:@"noclip.enabled"];
 }
 
@@ -185,6 +206,11 @@ static UILabel *NJLabel(NSString *text, CGFloat size, UIFontWeight weight, UICol
     self.panel.alpha = 0.0;
     self.panel.hidden = YES;
     self.panelVisible = NO;
+}
+
+- (BOOL)prefersStatusBarHidden
+{
+    return YES;
 }
 
 - (void)viewDidLayoutSubviews
@@ -554,7 +580,9 @@ static void noclip_init(void)
         gEnabled = [[NSUserDefaults standardUserDefaults] boolForKey:@"noclip.enabled"];
 
         dispatch_async(dispatch_get_main_queue(), ^{
-            // Apply the saved state once the runtime is fully up.
+            gd_probe();
+            BOOL hooked = gd_install_vtable_hook();
+            NSLog(@"[noclip] probe=%d vtableHook=%d enabled=%d", gBinaryOK, hooked, gEnabled);
             if (gEnabled) gd_patch_on();
 
             __block NSInteger tries = 0;
