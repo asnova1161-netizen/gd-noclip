@@ -50,7 +50,7 @@ static void noclip_destroy_player(void *self, void *player, void *object)
 {
     if (gEnabled) return;           // noclip: swallow the death
     if (gOrigDestroyPlayer) ((DestroyPlayerFn)gOrigDestroyPlayer)(self, player, object);
-    if (gAutoRestart && gResetOK) {
+    if (gAutoRestart && gResetOK && !gInReset) {
         gResetLayer = self;
         gResetRequested = YES;
     }
