@@ -572,28 +572,49 @@ static void NJInstallMenu(void)
     gWindow.hidden = NO;
 }
 
-__attribute__((constructor))
-static void noclip_init(void)
+static void noclip_boot(void)
 {
-    @autoreleasepool {
-        gImageBase = (uintptr_t)_dyld_get_image_header(0);
-        gEnabled = [[NSUserDefaults standardUserDefaults] boolForKey:@"noclip.enabled"];
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        @autoreleasepool {
+            gImageBase = (uintptr_t)_dyld_get_image_header(0);
+            gEnabled = [[NSUserDefaults standardUserDefaults] boolForKey:@"noclip.enabled"];
 
-        dispatch_async(dispatch_get_main_queue(), ^{
-            gd_probe();
-            BOOL hooked = gd_install_vtable_hook();
-            NSLog(@"[noclip] probe=%d vtableHook=%d enabled=%d", gBinaryOK, hooked, gEnabled);
-            if (gEnabled) gd_patch_on();
+            dispatch_async(dispatch_get_main_queue(), ^{
+                gd_probe();
+                BOOL hooked = gd_install_vtable_hook();
+                NSLog(@"[noclip] probe=%d vtableHook=%d enabled=%d", gBinaryOK, hooked, gEnabled);
+                if (gEnabled) gd_patch_on();
 
-            __block NSInteger tries = 0;
-            void (^tryInstall)(void) = ^{
-                NJInstallMenu();
-                if (!gWindow && ++tries < 120) {
-                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
-                                   dispatch_get_main_queue(), tryInstall);
-                }
-            };
-            tryInstall();
-        });
-    }
+                __block NSInteger tries = 0;
+                void (^tryInstall)(void) = ^{
+                    NJInstallMenu();
+                    if (!gWindow && ++tries < 120) {
+                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
+                                       dispatch_get_main_queue(), tryInstall);
+                    }
+                };
+                tryInstall();
+            });
+        }
+    });
 }
+
+__attribute__((constructor))
+static void noclip_ctor(void)
+{
+    noclip_boot();
+}
+
+// +load is the most portable early entry point for an injected dylib:
+// it does not depend on __init_offsets/__mod_init_func support in dyld.
+@interface NJBootstrap : NSObject
+@end
+
+@implementation NJBootstrap
++ (void)load
+{
+    noclip_boot();
+}
+@end
+
