@@ -1,0 +1,46 @@
+name: build-dylib
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    name: build Noclip.dylib
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: |
+          set -euxo pipefail
+          xcrun --sdk iphoneos --show-sdk-path
+          xcrun --sdk iphoneos clang++ \
+            -arch arm64 \
+            -miphoneos-version-min=14.0 \
+            -fobjc-arc -fblocks \
+            -O2 \
+            -dynamiclib \
+            -install_name @executable_path/Noclip.dylib \
+            -framework UIKit -framework Foundation \
+            -o Noclip.dylib NoclipTweak.mm
+          file Noclip.dylib
+          otool -hv Noclip.dylib | head -n 6
+
+      - name: Sign
+        run: |
+          set -euxo pipefail
+          brew install ldid || true
+          if command -v ldid >/dev/null 2>&1; then
+            ldid -S Noclip.dylib
+          fi
+          ls -l Noclip.dylib
+          otool -l Noclip.dylib | grep -A3 LC_CODE_SIGNATURE || true
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: Noclip-dylib
+          path: Noclip.dylib
+          if-no-files-found: error
