@@ -557,15 +557,28 @@ static UIWindowScene *NJFindScene(void)
     return nil;
 }
 
+static BOOL NJSceneBased(void)
+{
+    id manifest = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"UIApplicationSceneManifest"];
+    return [manifest isKindOfClass:[NSDictionary class]];
+}
+
 static void NJInstallMenu(void)
 {
     if (gWindow) return;
     UIWindowScene *scene = NJFindScene();
-    if (!scene) return;
+    if (!scene && NJSceneBased()) return; // scene-based app: wait until the scene connects
 
     gController = [[NJMenuController alloc] initWithNibName:nil bundle:nil];
-    gWindow = [[NJWindow alloc] initWithWindowScene:scene];
-    gWindow.frame = scene.coordinateSpace.bounds;
+    if (scene) {
+        gWindow = [[NJWindow alloc] initWithWindowScene:scene];
+        gWindow.frame = scene.coordinateSpace.bounds;
+    } else {
+        // Legacy app (Geometry Dash has no UIApplicationSceneManifest).
+        UIWindow *host = [UIApplication sharedApplication].keyWindow;
+        CGRect frame = host ? host.bounds : [UIScreen mainScreen].bounds;
+        gWindow = [[NJWindow alloc] initWithFrame:frame];
+    }
     gWindow.windowLevel = UIWindowLevelAlert + 100.0;
     gWindow.backgroundColor = [UIColor clearColor];
     gWindow.rootViewController = gController;
