@@ -195,6 +195,8 @@ static UILabel *NJLabel(NSString *text, CGFloat size, UIFontWeight weight, UICol
 
 @implementation NJMenuController
 
+@synthesize panelVisible = _panelVisible;
+
 - (void)viewDidLoad
 {
     [super viewDidLoad];
@@ -457,8 +459,8 @@ static UILabel *NJLabel(NSString *text, CGFloat size, UIFontWeight weight, UICol
 
 - (void)setPanelVisible:(BOOL)visible
 {
-    if (self.panelVisible == visible) return;
-    self.panelVisible = visible;
+    if (_panelVisible == visible) return;
+    _panelVisible = visible;
     if (visible) {
         self.panel.hidden = NO;
         self.panel.transform = CGAffineTransformMakeScale(0.96, 0.96);
