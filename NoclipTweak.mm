@@ -25,19 +25,15 @@
 #define GD_VTABLE_SLOT   159
 
 static BOOL        gEnabled = NO;
-static BOOL        gPatched = NO;
-static BOOL        gHaveOrig = NO;
 static BOOL        gBinaryOK = NO;
 static uintptr_t   gImageBase = 0;
 static void       *gOrigDestroyPlayer = NULL;
-static unsigned char gOrigCode[16];
 
 typedef void (*DestroyPlayerFn)(void *self, void *player, void *object);
 
 static void noclip_destroy_player(void *self, void *player, void *object)
 {
     if (gEnabled) return;           // noclip: swallow the death
-    if (gPatched) return;           // inline patch is live, calling the original would recurse
     if (gOrigDestroyPlayer) ((DestroyPlayerFn)gOrigDestroyPlayer)(self, player, object);
 }
 
@@ -77,48 +73,10 @@ static BOOL gd_install_vtable_hook(void)
     return YES;
 }
 
-static BOOL gd_patch_on(void)
-{
-    if (gPatched || !gBinaryOK) return NO;
-
-    uintptr_t fn = gImageBase + GD_DESTROY_OFF;
-    if (!gHaveOrig) {
-        memcpy(gOrigCode, (void *)fn, sizeof(gOrigCode));
-        gHaveOrig = YES;
-    }
-
-    unsigned char patch[16];
-    uint32_t i0 = 0x58000050u;  // ldr x16, #8
-    uint32_t i1 = 0xD61F0200u;  // br  x16
-    uint64_t dest = (uint64_t)(uintptr_t)&noclip_destroy_player;
-    memcpy(patch,     &i0, 4);
-    memcpy(patch + 4, &i1, 4);
-    memcpy(patch + 8, &dest, 8);
-
-    if (!vm_protect_span((void *)fn, 16, VM_PROT_READ | VM_PROT_WRITE, YES)) return NO;
-    memcpy((void *)fn, patch, 16);
-    sys_icache_invalidate((void *)fn, 16);
-    vm_protect_span((void *)fn, 16, VM_PROT_READ | VM_PROT_EXECUTE, NO);
-    gPatched = YES;
-    return YES;
-}
-
-static void gd_patch_off(void)
-{
-    if (!gPatched) return;
-    uintptr_t fn = gImageBase + GD_DESTROY_OFF;
-    if (!vm_protect_span((void *)fn, 16, VM_PROT_READ | VM_PROT_WRITE, YES)) return;
-    memcpy((void *)fn, gOrigCode, 16);
-    sys_icache_invalidate((void *)fn, 16);
-    vm_protect_span((void *)fn, 16, VM_PROT_READ | VM_PROT_EXECUTE, NO);
-    gPatched = NO;
-}
-
 static void noclip_set_enabled(BOOL on)
 {
     gEnabled = on;
-    BOOL patched = on ? gd_patch_on() : (gd_patch_off(), NO);
-    NSLog(@"[noclip] enabled=%d codePatched=%d", on, patched);
+    NSLog(@"[noclip] enabled=%d (vtable hook only)", on);
     [[NSUserDefaults standardUserDefaults] setBool:on forKey:@"noclip.enabled"];
 }
 
@@ -599,7 +557,6 @@ static void noclip_boot(void)
                 gd_probe();
                 BOOL hooked = gd_install_vtable_hook();
                 NSLog(@"[noclip] probe=%d vtableHook=%d enabled=%d", gBinaryOK, hooked, gEnabled);
-                if (gEnabled) gd_patch_on();
 
                 __block NSInteger tries = 0;
                 void (^tryInstall)(void) = ^{
