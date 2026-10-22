@@ -29,6 +29,7 @@
 #define GD_UPDATE_SLOT   5
 
 #define GD_RESET_OFF     0x11a550ULL
+#define GD_PLAYER_RESET_OFF 0x22f3d4ULL
 #define GD_RESTART_FLAG  0x367e
 #define GD_PLAYER_DEAD   0x9da
 #define GD_LAYER_DYING   0x30a2
@@ -40,17 +41,21 @@ static BOOL        gEnabled = NO;
 static BOOL        gAutoRestart = NO;
 static BOOL        gBinaryOK = NO;
 static BOOL        gResetOK = NO;
+static BOOL        gPlayerResetOK = NO;
 static BOOL        gResetting = NO;
-static BOOL        gPendingReset = NO;
+static BOOL        gResetRequested = NO;
+static void       *gResetLayer = NULL;
 static CFTimeInterval gLastReset = 0.0;
 static uintptr_t   gImageBase = 0;
 static void       *gOrigDestroyPlayer = NULL;
 static void       *gOrigUpdate = NULL;
 static float       gSpeed = 1.0f;
+static float       gCurrentSpeed = 1.0f;
 
 typedef void (*DestroyPlayerFn)(void *self, void *player, void *object);
 typedef void (*UpdateFn)(void *self, float dt);
 typedef void (*ResetLevelFn)(void *self);
+typedef void (*PlayerResetFn)(void *player);
 
 static float NJSpeedToSlider(float speed)
 {
@@ -92,32 +97,76 @@ static void noclip_destroy_player(void *self, void *player, void *object)
     if (gOrigDestroyPlayer) ((DestroyPlayerFn)gOrigDestroyPlayer)(self, player, object);
 
     if (!gOrigDestroyPlayer || !gAutoRestart || !gResetOK) return;
-    if (gResetting || gPendingReset || wasDead || wasDying) return;
+    if (gResetting || gResetRequested || wasDead || wasDying) return;
     if (CACurrentMediaTime() - gLastReset < 0.10) return;
 
-    // Run the reset on the next main-queue turn. The death function has
-    // already returned by then, so it is safe to tear down the level, and it
-    // does not wait for the death animation or any game update.
-    void *layer = self;
-    gPendingReset = YES;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        gPendingReset = NO;
-        if (!gAutoRestart || !gResetOK || gResetting) return;
-
-        gResetting = YES;
-        *((uint8_t *)layer + GD_RESTART_FLAG) = 0; // cancel delayed auto-restart
-        ((ResetLevelFn)(gImageBase + GD_RESET_OFF))(layer);
-        *((uint8_t *)layer + GD_RESTART_FLAG) = 0; // in case reset re-armed it
-        gLastReset = CACurrentMediaTime();
-        gResetting = NO;
-    });
+    // Do the actual reset at the beginning of the next PlayLayer update.
+    // This is a known-good point in the game loop: the death handler has
+    // returned, no object iteration is in progress, and the reset is not
+    // affected by the current speed multiplier.
+    gResetLayer = self;
+    gResetRequested = YES;
 }
 
 static void noclip_update(void *self, float dt)
 {
     if (!gOrigUpdate) return;
-    float scale = gSpeed;
-    if (scale < GD_SPEED_MIN || scale > GD_SPEED_MAX) scale = 1.0f;
+
+    if (gResetRequested) {
+        void *layer = gResetLayer;
+        gResetRequested = NO;
+        gResetLayer = NULL;
+        if (layer == self && gAutoRestart && gResetOK && !gResetting) {
+            gResetting = YES;
+
+            // Keep the game's own restart flag set while resetLevel runs; the
+            // normal death callback relies on that state. Clear it only after
+            // a successful reset so the later callback cannot reset twice.
+            ((ResetLevelFn)(gImageBase + GD_RESET_OFF))(self);
+
+            void *p1 = *(void **)((char *)self + 0xc90);
+            BOOL stillDead = p1 && *(uint8_t *)((char *)p1 + GD_PLAYER_DEAD);
+            if (stillDead && gPlayerResetOK) {
+                // resetLevel can run before the old death animation has fully
+                // cleared the player, especially at very low speed. Reset the
+                // player state explicitly so it does not immediately die in
+                // place on the first frame after respawning.
+                ((PlayerResetFn)(gImageBase + GD_PLAYER_RESET_OFF))(p1);
+                stillDead = *(uint8_t *)((char *)p1 + GD_PLAYER_DEAD) != 0;
+            }
+
+            if (stillDead) {
+                // Let the game's normal delayed restart take over as a
+                // fallback instead of retrying every frame (which would look
+                // like dying in place).
+                *((uint8_t *)self + GD_RESTART_FLAG) = 1;
+            } else {
+                *((uint8_t *)self + GD_RESTART_FLAG) = 0;
+            }
+
+            gLastReset = CACurrentMediaTime();
+            gResetting = NO;
+            return; // skip the old death update for this frame
+        }
+    }
+
+    // Smoothly approach the slider value instead of snapping the game speed.
+    float target = gSpeed;
+    if (target < GD_SPEED_MIN || target > GD_SPEED_MAX) target = 1.0f;
+    if (gCurrentSpeed < GD_SPEED_MIN || gCurrentSpeed > GD_SPEED_MAX) {
+        gCurrentSpeed = target;
+    }
+    float realDt = dt;
+    if (!isfinite(realDt) || realDt <= 0.0f) realDt = 1.0f / 60.0f;
+    if (realDt > 0.25f) realDt = 0.25f;
+    float blend = 1.0f - expf(-12.0f * realDt);
+    if (blend < 0.0f) blend = 0.0f;
+    if (blend > 1.0f) blend = 1.0f;
+    gCurrentSpeed += (target - gCurrentSpeed) * blend;
+    if (fabsf(target - gCurrentSpeed) < 0.0005f) gCurrentSpeed = target;
+
+    float scale = gCurrentSpeed;
+    if (scale < GD_SPEED_MIN || scale > GD_SPEED_MAX) scale = target;
     ((UpdateFn)gOrigUpdate)(self, dt * scale);
 }
 
@@ -148,6 +197,7 @@ static void gd_probe(void)
     gOrigDestroyPlayer = (void *)fn;
     gBinaryOK = YES;
     gResetOK = (*(uint32_t *)(gImageBase + GD_RESET_OFF) == 0xd10303ff); // sub sp, sp, #0xc0
+    gPlayerResetOK = (*(uint32_t *)(gImageBase + GD_PLAYER_RESET_OFF) == 0xa9be4ff4); // stp x20,x19,[sp,#-0x20]!
 }
 
 static BOOL gd_install_vtable_hook(void)
@@ -419,12 +469,12 @@ static UILabel *NJLabel(NSString *text, CGFloat size, UIFontWeight weight, UICol
     line2.backgroundColor = NJLine();
     [self.panel addSubview:line2];
 
-    // Speed row
-    UILabel *speedLabel = NJLabel(@"Speed", 13.0, UIFontWeightSemibold, NJText(), 0.0);
-    speedLabel.frame = CGRectMake(16, 98, 60, 18);
+    // Speedhack row
+    UILabel *speedLabel = NJLabel(@"Speedhack", 13.0, UIFontWeightSemibold, NJText(), 0.0);
+    speedLabel.frame = CGRectMake(16, 98, 74, 18);
     [self.panel addSubview:speedLabel];
 
-    self.speedSlider = [[UISlider alloc] initWithFrame:CGRectMake(78, 91, 140, 31)];
+    self.speedSlider = [[UISlider alloc] initWithFrame:CGRectMake(92, 91, 126, 31)];
     self.speedSlider.minimumValue = 0.0f;
     self.speedSlider.maximumValue = 1.0f;
     self.speedSlider.value = NJSpeedToSlider(gSpeed);
@@ -433,6 +483,7 @@ static UILabel *NJLabel(NSString *text, CGFloat size, UIFontWeight weight, UICol
     self.speedSlider.thumbTintColor = [UIColor whiteColor];
     self.speedSlider.continuous = YES;
     [self.speedSlider addTarget:self action:@selector(speedChanged:) forControlEvents:UIControlEventValueChanged];
+    [self.speedSlider addTarget:self action:@selector(speedCommitted:) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside | UIControlEventTouchCancel];
     [self.panel addSubview:self.speedSlider];
 
     self.speedValue = NJLabel(NJSpeedText(gSpeed), 12.0, UIFontWeightSemibold, NJText(), 0.0);
@@ -466,14 +517,16 @@ static UILabel *NJLabel(NSString *text, CGFloat size, UIFontWeight weight, UICol
 
 - (void)speedChanged:(UISlider *)sender
 {
+    // Do not assign sender.value from inside this callback and do not snap to
+    // 1.0 while the finger is down: both make the thumb jump under a slow drag.
     float value = NJSliderToSpeed(sender.value);
-    if (fabsf(value - 1.0f) < 0.05f) {
-        value = 1.0f;
-        sender.value = NJSpeedToSlider(1.0f);
-    }
     gSpeed = value;
     self.speedValue.text = NJSpeedText(value);
-    [[NSUserDefaults standardUserDefaults] setFloat:value forKey:@"noclip.speed"];
+}
+
+- (void)speedCommitted:(UISlider *)sender
+{
+    [[NSUserDefaults standardUserDefaults] setFloat:gSpeed forKey:@"noclip.speed"];
 }
 
 - (void)restartChanged:(UISwitch *)sender
@@ -662,6 +715,7 @@ static void noclip_boot(void)
             if (gSpeed <= 0.0f) gSpeed = 1.0f;
             if (gSpeed < GD_SPEED_MIN) gSpeed = GD_SPEED_MIN;
             if (gSpeed > GD_SPEED_MAX) gSpeed = GD_SPEED_MAX;
+            gCurrentSpeed = gSpeed;
 
             dispatch_async(dispatch_get_main_queue(), ^{
                 gd_probe();
