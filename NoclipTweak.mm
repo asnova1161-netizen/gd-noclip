@@ -43,6 +43,15 @@
 #define GD_PLAYER_RECT_OFF   0x262708ULL
 #define GD_PLAYER_RECT_SLOT  164
 
+// GameObject's primary vtable.  Its getObjectRect() is at slot 164 as well and
+// points at the same implementation as PlayerObject's override.  Hooking both
+// vtables is intentional: shrinking only the player did not change spike deaths
+// on all builds, while shrinking the object rectangle always affects the
+// collision path (and is also what makes the overlap visibly deeper).
+#define GD_OBJECT_VTABLE_OFF 0x7d9708ULL
+#define GD_OBJECT_RECT_SLOT  164
+#define GD_OBJECT_RECT_OFF   0x262708ULL
+
 #define GD_SPEED_MIN     0.1f
 #define GD_SPEED_MAX     100.0f
 #define GD_HITBOX_MIN    0.10f
@@ -54,11 +63,15 @@ static BOOL        gBinaryOK = NO;
 static BOOL        gResetOK = NO;
 static BOOL        gPlayerResetOK = NO;
 static BOOL        gHitboxOK = NO;
+static BOOL        gObjectHitboxOK = NO;
+static BOOL        gSpeedEngaged = NO;
 static BOOL        gResetting = NO;
 static BOOL        gResetRequested = NO;
 static BOOL        gUpdateHooked = NO;
 static BOOL        gNoclipHooked = NO;
 static BOOL        gHitboxHooked = NO;
+static BOOL        gPlayerRectHooked = NO;
+static BOOL        gObjectRectHooked = NO;
 static void       *gResetLayer = NULL;
 static CFTimeInterval gLastReset = 0.0;
 static CFTimeInterval gNoRestartUntil = 0.0;
@@ -66,6 +79,7 @@ static uintptr_t   gImageBase = 0;
 static void       *gOrigDestroyPlayer = NULL;
 static void       *gOrigUpdate = NULL;
 static void       *gOrigPlayerRect = NULL;
+static void       *gOrigObjectRect = NULL;
 static float       gSpeed = 1.0f;
 static float       gCurrentSpeed = 1.0f;
 static float       gHitbox = 1.0f;
@@ -155,13 +169,12 @@ static void noclip_update(void *self, float dt)
             // delayed callback calls resetLevel a second time, which at very
             // low speeds turns into an endless death/reset loop.
             *((uint8_t *)self + GD_RESTART_FLAG) = 0;
-            ((ResetLevelFn)(gImageBase + GD_RESET_OFF))(self);
-            *((uint8_t *)self + GD_RESTART_FLAG) = 0;
 
-            // resetLevel normally resets both player objects. If the old death
-            // state is still present at a slow speed, only clear the dead bit.
-            // Do not call PlayerObject::reset here: that zeroes the player's
-            // position and can make the freshly spawned cube die in place.
+            // Clear the death state *before* resetLevel.  resetLevel calls the
+            // player's vtable reset and, at 0.10x, can otherwise leave the old
+            // dead player at the death position; the next frame then looks
+            // like an in-place death.
+            *((uint8_t *)self + GD_LAYER_DYING) = 0;
             void *p1 = *(void **)((char *)self + 0xc90);
             if (p1 && *(uint8_t *)((char *)p1 + GD_PLAYER_DEAD)) {
                 *(uint8_t *)((char *)p1 + GD_PLAYER_DEAD) = 0;
@@ -171,11 +184,29 @@ static void noclip_update(void *self, float dt)
                 *(uint8_t *)((char *)p2 + GD_PLAYER_DEAD) = 0;
             }
 
+            ((ResetLevelFn)(gImageBase + GD_RESET_OFF))(self);
+            *((uint8_t *)self + GD_RESTART_FLAG) = 0;
+            *((uint8_t *)self + GD_LAYER_DYING) = 0;
+
+            // resetLevel normally resets both players. Clear any stale dead
+            // bit again after it has run.
+            p1 = *(void **)((char *)self + 0xc90);
+            if (p1 && *(uint8_t *)((char *)p1 + GD_PLAYER_DEAD)) {
+                *(uint8_t *)((char *)p1 + GD_PLAYER_DEAD) = 0;
+            }
+            p2 = *(void **)((char *)self + 0xc98);
+            if (p2 && p2 != p1 && *(uint8_t *)((char *)p2 + GD_PLAYER_DEAD)) {
+                *(uint8_t *)((char *)p2 + GD_PLAYER_DEAD) = 0;
+            }
+
             gLastReset = now;
-            // Give the new attempt a moment to settle. If something still
-            // kills the player on the first frame, fall back to the game's
-            // normal delayed retry instead of requesting a reset every frame.
-            gNoRestartUntil = now + 0.35;
+            gNoRestartUntil = now + 0.30;
+
+            // Run one normal-speed update after the reset.  At 0.10x the death
+            // animation/retry is advanced with a tiny dt, which can leave the
+            // fresh cube in the old position for several frames.  One native
+            // frame lets resetLevel position and activate the player properly.
+            ((UpdateFn)gOrigUpdate)(self, 1.0f / 60.0f);
             gResetting = NO;
             return; // skip the old death update for this frame
         }
@@ -190,7 +221,7 @@ static void noclip_update(void *self, float dt)
     float realDt = dt;
     if (!isfinite(realDt) || realDt <= 0.0f) realDt = 1.0f / 60.0f;
     if (realDt > 0.25f) realDt = 0.25f;
-    float blend = 1.0f - expf(-12.0f * realDt);
+    float blend = 1.0f - expf(-6.0f * realDt);
     if (blend < 0.0f) blend = 0.0f;
     if (blend > 1.0f) blend = 1.0f;
     gCurrentSpeed += (target - gCurrentSpeed) * blend;
@@ -244,6 +275,19 @@ static void gd_probe(void)
         gOrigPlayerRect = *rectSlot;
         gHitboxOK = YES;
     }
+
+    // GameObject's primary vtable.  This is the rectangle used when a level
+    // object is tested against the player.  Hooking it makes the slider work
+    // even if a spike collision bypasses PlayerObject's own getObjectRect().
+    uintptr_t objectVT = gImageBase + GD_OBJECT_VTABLE_OFF;
+    uintptr_t objectTypeInfo = *(uintptr_t *)(objectVT - sizeof(void *));
+    const char *objectName = objectTypeInfo ? *(const char **)(objectTypeInfo + sizeof(void *)) : NULL;
+    void **objectRectSlot = (void **)(objectVT + GD_OBJECT_RECT_SLOT * sizeof(void *));
+    if (objectName && strcmp(objectName, "10GameObject") == 0 &&
+        *objectRectSlot == (void *)(gImageBase + GD_OBJECT_RECT_OFF)) {
+        gOrigObjectRect = *objectRectSlot;
+        gObjectHitboxOK = YES;
+    }
 }
 
 static BOOL gd_install_noclip_hook(void)
@@ -283,10 +327,10 @@ static void gd_sync_noclip_hook(void)
     }
 }
 
-static void *noclip_player_rect(void *self)
+static void *noclip_scale_rect(void *self, PlayerRectFn original)
 {
-    if (!gOrigPlayerRect) return NULL;
-    NJRect *src = (NJRect *)((PlayerRectFn)gOrigPlayerRect)(self);
+    if (!original) return NULL;
+    NJRect *src = (NJRect *)original(self);
     if (!src) return NULL;
 
     NJRect *out = &gPlayerRects[gPlayerRectIndex++ & 7u];
@@ -306,35 +350,69 @@ static void *noclip_player_rect(void *self)
     return out;
 }
 
-static BOOL gd_install_hitbox_hook(void)
+static void *noclip_player_rect(void *self)
 {
-    if (!gBinaryOK || !gHitboxOK) return NO;
-    if (gHitbox >= GD_HITBOX_MAX - 0.0005f) return NO;
-    void **slot = (void **)(gImageBase + GD_PLAYER_VTABLE_OFF + GD_PLAYER_RECT_SLOT * 8);
-    if (*slot == (void *)&noclip_player_rect) {
-        gHitboxHooked = YES;
+    return noclip_scale_rect(self, (PlayerRectFn)gOrigPlayerRect);
+}
+
+static void *noclip_object_rect(void *self)
+{
+    return noclip_scale_rect(self, (PlayerRectFn)gOrigObjectRect);
+}
+
+static BOOL gd_install_rect_hook(uintptr_t vtoff, void *original, void *replacement, BOOL *installed)
+{
+    if (!gBinaryOK || !original) return NO;
+    void **slot = (void **)(gImageBase + vtoff + GD_PLAYER_RECT_SLOT * sizeof(void *));
+    if (*slot == replacement) {
+        *installed = YES;
         return YES;
     }
-    if (*slot != gOrigPlayerRect) return NO;
+    if (*slot != original) return NO;
     if (!vm_protect_span(slot, sizeof(void *), VM_PROT_READ | VM_PROT_WRITE, NO)) return NO;
-    *slot = (void *)&noclip_player_rect;
-    gHitboxHooked = YES;
+    *slot = replacement;
+    *installed = YES;
     return YES;
+}
+
+static void gd_uninstall_rect_hook(uintptr_t vtoff, void *original, void *replacement, BOOL *installed)
+{
+    if (!*installed || !original) return;
+    void **slot = (void **)(gImageBase + vtoff + GD_PLAYER_RECT_SLOT * sizeof(void *));
+    if (*slot != replacement) { *installed = NO; return; }
+    if (!vm_protect_span(slot, sizeof(void *), VM_PROT_READ | VM_PROT_WRITE, NO)) return;
+    *slot = original;
+    *installed = NO;
+}
+
+static BOOL gd_install_hitbox_hook(void)
+{
+    if (!gBinaryOK || gHitbox >= GD_HITBOX_MAX - 0.0005f) return NO;
+    BOOL any = NO;
+    if (gHitboxOK) {
+        any |= gd_install_rect_hook(GD_PLAYER_VTABLE_OFF, gOrigPlayerRect,
+                                   (void *)&noclip_player_rect, &gPlayerRectHooked);
+    }
+    if (gObjectHitboxOK) {
+        any |= gd_install_rect_hook(GD_OBJECT_VTABLE_OFF, gOrigObjectRect,
+                                   (void *)&noclip_object_rect, &gObjectRectHooked);
+    }
+    gHitboxHooked = any;
+    return any;
 }
 
 static void gd_uninstall_hitbox_hook(void)
 {
-    if (!gHitboxHooked || !gOrigPlayerRect) return;
-    void **slot = (void **)(gImageBase + GD_PLAYER_VTABLE_OFF + GD_PLAYER_RECT_SLOT * 8);
-    if (*slot != (void *)&noclip_player_rect) { gHitboxHooked = NO; return; }
-    if (!vm_protect_span(slot, sizeof(void *), VM_PROT_READ | VM_PROT_WRITE, NO)) return;
-    *slot = gOrigPlayerRect;
+    gd_uninstall_rect_hook(GD_PLAYER_VTABLE_OFF, gOrigPlayerRect,
+                           (void *)&noclip_player_rect, &gPlayerRectHooked);
+    gd_uninstall_rect_hook(GD_OBJECT_VTABLE_OFF, gOrigObjectRect,
+                           (void *)&noclip_object_rect, &gObjectRectHooked);
     gHitboxHooked = NO;
 }
 
 static void gd_sync_hitbox_hook(void)
 {
-    if (!gBinaryOK || !gHitboxOK ||
+    if (!gBinaryOK || (!gHitboxOK && !gObjectHitboxOK) ||
         gHitbox >= GD_HITBOX_MAX - 0.0005f) {
         gd_uninstall_hitbox_hook();
     } else {
@@ -373,7 +451,10 @@ static void gd_uninstall_update_hook(void)
 // game on its exact native timing path.
 static BOOL gd_update_hook_needed(void)
 {
-    return gAutoRestart ||
+    // Keep the update hook installed after the user has used the speed slider
+    // until the app is restarted.  Uninstalling it while gCurrentSpeed is still
+    // catching up to 1.00x would make the game jump abruptly to full speed.
+    return gAutoRestart || gSpeedEngaged ||
            fabsf(gSpeed - 1.0f) > 0.0001f ||
            fabsf(gCurrentSpeed - 1.0f) > 0.0001f;
 }
@@ -718,6 +799,7 @@ static UILabel *NJLabel(NSString *text, CGFloat size, UIFontWeight weight, UICol
     float value = NJSliderToSpeed(sender.value);
     if (!isfinite(value)) value = 1.0f;
     gSpeed = value;
+    gSpeedEngaged = YES;
     self.speedValue.text = NJSpeedText(value);
     gd_sync_update_hook();
 }
@@ -946,6 +1028,7 @@ static void noclip_boot(void)
             if (gSpeed < GD_SPEED_MIN) gSpeed = GD_SPEED_MIN;
             if (gSpeed > GD_SPEED_MAX) gSpeed = GD_SPEED_MAX;
             gCurrentSpeed = gSpeed;
+            gSpeedEngaged = (fabsf(gSpeed - 1.0f) > 0.0001f);
             gHitbox = [defaults floatForKey:@"noclip.hitbox"];
             if (!isfinite(gHitbox) || gHitbox <= 0.0f) gHitbox = GD_HITBOX_MAX;
             if (gHitbox < GD_HITBOX_MIN) gHitbox = GD_HITBOX_MIN;
