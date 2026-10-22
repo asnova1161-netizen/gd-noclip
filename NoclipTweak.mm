@@ -9,6 +9,7 @@
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <mach/mach.h>
+#import <objc/runtime.h>
 #import <mach/vm_map.h>
 #import <mach-o/dyld.h>
 #import <libkern/OSCacheControl.h>
@@ -75,8 +76,6 @@ static BOOL        gHitboxHooked = NO;
 static BOOL        gPlayerRectHooked = NO;
 static BOOL        gObjectRectHooked = NO;
 static void       *gResetLayer = NULL;
-static CFTimeInterval gLastReset = 0.0;
-static CFTimeInterval gNoRestartUntil = 0.0;
 static uintptr_t   gImageBase = 0;
 static void       *gOrigDestroyPlayer = NULL;
 static void       *gOrigUpdate = NULL;
@@ -127,24 +126,15 @@ static void noclip_destroy_player(void *self, void *player, void *object)
     if (gEnabled) return;           // noclip: swallow the death
     if (gResetting) return;         // ignore deaths caused by our own reset
 
-    // Detect whether this is a fresh death. If the player is already dead (or
-    // the layer is already in its death sequence), this call is a replay of an
-    // old death (for example from resetLevel), not a new one. Never arm an
-    // instant respawn for those, otherwise enabling the toggle can start a
-    // reset loop.
-    void *player1 = *(void **)((char *)self + 0xc90);
-    BOOL wasDead = player1 && *(uint8_t *)((char *)player1 + GD_PLAYER_DEAD);
-    BOOL wasDying = *(uint8_t *)((char *)self + GD_LAYER_DYING);
-
     if (gOrigDestroyPlayer) ((DestroyPlayerFn)gOrigDestroyPlayer)(self, player, object);
 
     if (!gOrigDestroyPlayer || !gAutoRestart || !gResetOK) return;
-    double levelTime = *(double *)((char *)self + GD_LEVEL_TIME);
-    if (!isfinite(levelTime) || levelTime < 0.5) return; // ignore spawn-time deaths
-    if (gResetting || gResetRequested || wasDead || wasDying) return;
-    CFTimeInterval now = CACurrentMediaTime();
-    if (now < gNoRestartUntil) return;
-    if (now - gLastReset < 0.10) return;
+    // Any real death is enough.  Do not gate this on level time or a cooldown:
+    // dying in the first half-second (including at 0%) must restart instantly
+    // too, especially at 0.10x where half a second of level time is long.
+    // gResetting/gResetRequested already suppress duplicate death callbacks
+    // from the same death.
+    if (gResetting || gResetRequested) return;
 
     // The game schedules its own auto-retry (the +0x367e flag) after a death.
     // We perform the reset ourselves on the next PlayLayer update and clear
@@ -164,7 +154,6 @@ static void noclip_update(void *self, float dt)
         gResetLayer = NULL;
         if (layer == self && gAutoRestart && gResetOK && !gResetting) {
             gResetting = YES;
-            CFTimeInterval now = CACurrentMediaTime();
 
             // destroyPlayer always arms the game's own delayed auto-retry.
             // Cancel it before and after our immediate reset: otherwise the
@@ -204,9 +193,6 @@ static void noclip_update(void *self, float dt)
             if (p2 && p2 != p1 && *(uint8_t *)((char *)p2 + GD_PLAYER_DEAD)) {
                 *(uint8_t *)((char *)p2 + GD_PLAYER_DEAD) = 0;
             }
-
-            gLastReset = now;
-            gNoRestartUntil = now + 0.30;
 
             // Run one normal-speed update after the reset.  At 0.10x the death
             // animation/retry is advanced with a tiny dt, which can leave the
@@ -297,6 +283,37 @@ static void gd_probe(void)
     }
 }
 
+// Some TrollStore/patched builds end up with a CADisplayLink capped at 30 Hz
+// (or the game lowers it itself).  Speedhack must not change the render rate:
+// slowing/speeding is done in PlayLayer::update, while the display link stays
+// at 60.  Swizzle CCDirectorCaller's display-link callback and pin it to 60.
+static IMP gOrigDoCaller = NULL;
+
+static void noclip_do_caller(id self, SEL _cmd, id sender)
+{
+    if (sender &&
+        [sender respondsToSelector:@selector(preferredFramesPerSecond)] &&
+        [sender respondsToSelector:@selector(setPreferredFramesPerSecond:)]) {
+        if ([sender preferredFramesPerSecond] != 60) {
+            [sender setPreferredFramesPerSecond:60];
+        }
+    }
+    if (gOrigDoCaller) ((void (*)(id, SEL, id))gOrigDoCaller)(self, _cmd, sender);
+}
+
+static void gd_install_fps_hook(void)
+{
+    static BOOL installed = NO;
+    if (installed) return;
+    Class cls = NSClassFromString(@"CCDirectorCaller");
+    if (!cls) return;
+    Method method = class_getInstanceMethod(cls, @selector(doCaller:));
+    if (!method) return;
+    gOrigDoCaller = method_setImplementation(method, (IMP)noclip_do_caller);
+    installed = YES;
+    NSLog(@"[noclip] CCDirectorCaller hooked for 60 FPS");
+}
+
 static BOOL gd_install_noclip_hook(void)
 {
     if (!gBinaryOK) return NO;
@@ -322,12 +339,13 @@ static void gd_uninstall_noclip_hook(void)
     gNoclipHooked = NO;
 }
 
-// Noclip is now installed only while the toggle is on.  With all features off
-// the game runs with its original vtables, which also makes a 0% hang easy to
-// distinguish from a game/save problem.
+// destroyPlayer is needed by both features: Noclip swallows the death, while
+// Instant Restart observes a real death.  Keep the hook installed when either
+// toggle is on.  This was the reason Instant Restart did nothing when Noclip
+// was off (which is the normal way to test it).
 static void gd_sync_noclip_hook(void)
 {
-    if (!gBinaryOK || !gEnabled) {
+    if (!gBinaryOK || (!gEnabled && !gAutoRestart)) {
         gd_uninstall_noclip_hook();
     } else {
         gd_install_noclip_hook();
@@ -820,6 +838,7 @@ static UILabel *NJLabel(NSString *text, CGFloat size, UIFontWeight weight, UICol
 {
     gAutoRestart = sender.isOn;
     [[NSUserDefaults standardUserDefaults] setBool:gAutoRestart forKey:@"noclip.instantRestart"];
+    gd_sync_noclip_hook();
     gd_sync_update_hook();
 }
 
@@ -1042,6 +1061,7 @@ static void noclip_boot(void)
             if (gHitbox > GD_HITBOX_MAX) gHitbox = GD_HITBOX_MAX;
 
             dispatch_async(dispatch_get_main_queue(), ^{
+                gd_install_fps_hook();
                 gd_probe();
                 gd_sync_noclip_hook();
                 gd_sync_hitbox_hook();
@@ -1052,6 +1072,7 @@ static void noclip_boot(void)
 
                 __block NSInteger tries = 0;
                 void (^tryInstall)(void) = ^{
+                    gd_install_fps_hook();
                     NJInstallMenu();
                     if (!gController && ++tries < 120) {
                         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)),
