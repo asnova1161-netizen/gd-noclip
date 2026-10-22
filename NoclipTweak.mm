@@ -37,6 +37,21 @@
 #define GD_LAYER_DYING   0x30a2
 #define GD_LEVEL_TIME    0x390
 
+// Inside PlayLayer::destroyPlayer(), the player's death routine is called with
+// noEffects = 0.  That flag makes PlayerObject::playerDestroyed skip the
+// explosion animation/particles while keeping the normal death, attempt count,
+// game-over state, and Instant Restart behaviour intact.  The next instruction
+// pair plays explode_11.ogg; if the user wants the effect fully gone, skip that
+// sound block too.  Both instructions are verified before any write so a
+// different game build can never be corrupted by this tweak.
+#define GD_NOFX_ARG_OFF   0x1201b4ULL
+#define GD_NOFX_ARG_ORIG  0x52800001U   // mov w1, #0
+#define GD_NOFX_ARG_PATCH 0x52800021U   // mov w1, #1
+
+#define GD_NOFX_SOUND_OFF   0x120448ULL
+#define GD_NOFX_SOUND_ORIG  0x35000248U // cbnz w8, #0x120490
+#define GD_NOFX_SOUND_PATCH 0x14000012U // b #0x120490
+
 // PlayerObject vtable slot 164 is getObjectRect().  The function at slot 164
 // delegates to getObjectRect(w,h) and returns the player's collision rectangle.
 // Scaling that rectangle is the hitbox multiplier: a smaller player hitbox lets
@@ -67,6 +82,11 @@ static BOOL        gResetFromStartOK = NO;
 static BOOL        gPlayerResetOK = NO;
 static BOOL        gHitboxOK = NO;
 static BOOL        gObjectHitboxOK = NO;
+static BOOL        gDeathFxOK = NO;
+static BOOL        gDeathFxSoundOK = NO;
+static BOOL        gNoDeathFx = NO;
+static BOOL        gNoDeathFxArgPatched = NO;
+static BOOL        gNoDeathFxSoundPatched = NO;
 static BOOL        gSpeedEngaged = NO;
 static BOOL        gResetting = NO;
 static BOOL        gResetRequested = NO;
@@ -236,6 +256,71 @@ static BOOL vm_protect_span(void *addr, size_t len, vm_prot_t prot, BOOL copy)
     return kr == KERN_SUCCESS;
 }
 
+// Patching one instruction in PlayLayer::destroyPlayer is enough to make the
+// game's own death routine take the "no effects" path.  The expected original
+// value is checked first, and the page is made writable only for the write
+// itself.  This is intentionally not an inline branch hook: no executable
+// trampoline or relocation is involved.
+static BOOL gd_patch_code_word(uintptr_t off, uint32_t from, uint32_t to)
+{
+    if (!gImageBase) return NO;
+    uint32_t *insn = (uint32_t *)(gImageBase + off);
+    if (*insn == to) return YES;
+    if (*insn != from) return NO;
+
+    // VM_PROT_COPY gives us a private copy of the executable page.  Some
+    // TrollStore/device combinations reject adding write access without it.
+    if (!vm_protect_span(insn, sizeof(*insn),
+                         VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE, YES)) {
+        if (!vm_protect_span(insn, sizeof(*insn),
+                             VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE, NO)) {
+            return NO;
+        }
+    }
+
+    *insn = to;
+    sys_icache_invalidate(insn, sizeof(*insn));
+
+    // Put the page back to executable-only.  A failure here is not fatal: the
+    // instruction is already written and the code cache was invalidated.
+    vm_protect_span(insn, sizeof(*insn), VM_PROT_READ | VM_PROT_EXECUTE, NO);
+    return *insn == to;
+}
+
+// "No Death FX" is implemented by changing the noEffects argument that
+// PlayLayer::destroyPlayer passes to PlayerObject::playerDestroyed.  The normal
+// death path still runs (attempt count, game-over, retry, Instant Restart), but
+// the explosion animation/particles are skipped.  The adjacent death-sound
+// block is skipped as well, so the death is visually and audibly silent.
+static void gd_sync_death_fx(void)
+{
+    if (!gBinaryOK) return;
+
+    if (gNoDeathFx) {
+        if (gDeathFxOK && !gNoDeathFxArgPatched) {
+            gNoDeathFxArgPatched = gd_patch_code_word(
+                GD_NOFX_ARG_OFF, GD_NOFX_ARG_ORIG, GD_NOFX_ARG_PATCH);
+        }
+        if (gDeathFxSoundOK && !gNoDeathFxSoundPatched) {
+            gNoDeathFxSoundPatched = gd_patch_code_word(
+                GD_NOFX_SOUND_OFF, GD_NOFX_SOUND_ORIG, GD_NOFX_SOUND_PATCH);
+        }
+    } else {
+        if (gNoDeathFxArgPatched) {
+            if (gd_patch_code_word(GD_NOFX_ARG_OFF, GD_NOFX_ARG_PATCH,
+                                   GD_NOFX_ARG_ORIG)) {
+                gNoDeathFxArgPatched = NO;
+            }
+        }
+        if (gNoDeathFxSoundPatched) {
+            if (gd_patch_code_word(GD_NOFX_SOUND_OFF, GD_NOFX_SOUND_PATCH,
+                                   GD_NOFX_SOUND_ORIG)) {
+                gNoDeathFxSoundPatched = NO;
+            }
+        }
+    }
+}
+
 static void gd_probe(void)
 {
     gImageBase = (uintptr_t)_dyld_get_image_header(0);
@@ -256,6 +341,14 @@ static void gd_probe(void)
     gResetOK = (*(uint32_t *)(gImageBase + GD_RESET_OFF) == 0xd10303ff); // sub sp, sp, #0xc0
     gResetFromStartOK = (*(uint32_t *)(gImageBase + GD_RESET_FROM_START_OFF) == 0xa9bd57f6); // stp x22,x21,[sp,#-0x30]!
     gPlayerResetOK = (*(uint32_t *)(gImageBase + GD_PLAYER_RESET_OFF) == 0xa9be4ff4); // stp x20,x19,[sp,#-0x20]!
+
+    // Death-FX patch sites.  They are inside the already-validated
+    // PlayLayer::destroyPlayer() function.
+    uint32_t noFxArg = *(uint32_t *)(gImageBase + GD_NOFX_ARG_OFF);
+    uint32_t noFxSound = *(uint32_t *)(gImageBase + GD_NOFX_SOUND_OFF);
+    gDeathFxOK = (noFxArg == GD_NOFX_ARG_ORIG || noFxArg == GD_NOFX_ARG_PATCH);
+    gDeathFxSoundOK = (noFxSound == GD_NOFX_SOUND_ORIG ||
+                       noFxSound == GD_NOFX_SOUND_PATCH);
 
     // Validate the PlayerObject vtable and getObjectRect() slot before using
     // the hitbox multiplier.  The typeinfo name is the final safety check.
@@ -571,6 +664,7 @@ static UILabel *NJLabel(NSString *text, CGFloat size, UIFontWeight weight, UICol
 @property (nonatomic, strong) UIView *panelHeader;
 @property (nonatomic, strong) UISwitch *toggle;
 @property (nonatomic, strong) UISwitch *restartToggle;
+@property (nonatomic, strong) UISwitch *deathFxToggle;
 @property (nonatomic, strong) UISlider *speedSlider;
 @property (nonatomic, strong) UILabel *speedValue;
 @property (nonatomic, strong) UISlider *hitboxSlider;
@@ -690,7 +784,7 @@ static UILabel *NJLabel(NSString *text, CGFloat size, UIFontWeight weight, UICol
 - (void)buildPanel
 {
     CGFloat pw = 300.0;
-    CGFloat ph = 220.0;
+    CGFloat ph = 262.0;
     self.panel = [[UIView alloc] initWithFrame:CGRectMake(0, 0, pw, ph)];
     self.panel.backgroundColor = NJPanel();
     self.panel.layer.cornerRadius = 16.0;
@@ -785,14 +879,31 @@ static UILabel *NJLabel(NSString *text, CGFloat size, UIFontWeight weight, UICol
     line4.backgroundColor = NJLine();
     [self.panel addSubview:line4];
 
+    // Death-effect row.  ON keeps the normal death/retry logic but skips the
+    // explosion animation, particles, and death sound.
+    UILabel *deathFxLabel = NJLabel(@"No Death FX", 13.0, UIFontWeightSemibold, NJText(), 0.0);
+    deathFxLabel.frame = CGRectMake(16, 182, 180, 18);
+    [self.panel addSubview:deathFxLabel];
+
+    self.deathFxToggle = [[UISwitch alloc] initWithFrame:CGRectMake(pw - 67, 176, 51, 31)];
+    self.deathFxToggle.onTintColor = NJAccent();
+    self.deathFxToggle.thumbTintColor = [UIColor whiteColor];
+    self.deathFxToggle.on = gNoDeathFx;
+    [self.deathFxToggle addTarget:self action:@selector(deathFxChanged:) forControlEvents:UIControlEventValueChanged];
+    [self.panel addSubview:self.deathFxToggle];
+
+    UIView *line5 = [[UIView alloc] initWithFrame:CGRectMake(16, 212, pw - 32, 1)];
+    line5.backgroundColor = NJLine();
+    [self.panel addSubview:line5];
+
     // Hitbox multiplier: 1.00x is the untouched player hitbox.  Moving the
     // slider left shrinks only the player's collision rectangle, so spikes and
     // solid obstacles can overlap the sprite before a death is triggered.
     UILabel *hitboxLabel = NJLabel(@"Hitbox", 13.0, UIFontWeightSemibold, NJText(), 0.0);
-    hitboxLabel.frame = CGRectMake(16, 182, 82, 18);
+    hitboxLabel.frame = CGRectMake(16, 224, 82, 18);
     [self.panel addSubview:hitboxLabel];
 
-    self.hitboxSlider = [[UISlider alloc] initWithFrame:CGRectMake(102, 175, 116, 31)];
+    self.hitboxSlider = [[UISlider alloc] initWithFrame:CGRectMake(102, 217, 116, 31)];
     self.hitboxSlider.minimumValue = GD_HITBOX_MIN;
     self.hitboxSlider.maximumValue = GD_HITBOX_MAX;
     self.hitboxSlider.value = gHitbox;
@@ -806,7 +917,7 @@ static UILabel *NJLabel(NSString *text, CGFloat size, UIFontWeight weight, UICol
 
     self.hitboxValue = NJLabel([NSString stringWithFormat:@"%.2f\u00d7", gHitbox], 12.0, UIFontWeightSemibold, NJText(), 0.0);
     self.hitboxValue.textAlignment = NSTextAlignmentRight;
-    self.hitboxValue.frame = CGRectMake(pw - 72, 182, 56, 18);
+    self.hitboxValue.frame = CGRectMake(pw - 72, 224, 56, 18);
     [self.panel addSubview:self.hitboxValue];
 
     [self.view addSubview:self.panel];
@@ -840,6 +951,15 @@ static UILabel *NJLabel(NSString *text, CGFloat size, UIFontWeight weight, UICol
     [[NSUserDefaults standardUserDefaults] setBool:gAutoRestart forKey:@"noclip.instantRestart"];
     gd_sync_noclip_hook();
     gd_sync_update_hook();
+}
+
+- (void)deathFxChanged:(UISwitch *)sender
+{
+    gNoDeathFx = sender.isOn;
+    [[NSUserDefaults standardUserDefaults] setBool:gNoDeathFx forKey:@"noclip.noDeathFx"];
+    gd_sync_death_fx();
+    NSLog(@"[noclip] noDeathFx=%d argPatch=%d soundPatch=%d",
+          gNoDeathFx, gNoDeathFxArgPatched, gNoDeathFxSoundPatched);
 }
 
 - (void)hitboxChanged:(UISlider *)sender
@@ -1059,6 +1179,7 @@ static void noclip_boot(void)
             if (!isfinite(gHitbox) || gHitbox <= 0.0f) gHitbox = GD_HITBOX_MAX;
             if (gHitbox < GD_HITBOX_MIN) gHitbox = GD_HITBOX_MIN;
             if (gHitbox > GD_HITBOX_MAX) gHitbox = GD_HITBOX_MAX;
+            gNoDeathFx = [defaults boolForKey:@"noclip.noDeathFx"];
 
             dispatch_async(dispatch_get_main_queue(), ^{
                 gd_install_fps_hook();
@@ -1066,9 +1187,11 @@ static void noclip_boot(void)
                 gd_sync_noclip_hook();
                 gd_sync_hitbox_hook();
                 gd_sync_update_hook();
-                NSLog(@"[noclip] probe=%d noclipHook=%d hitboxHook=%d speedHook=%d reset=%d enabled=%d restart=%d speed=%.2f hitbox=%.2f",
+                gd_sync_death_fx();
+                NSLog(@"[noclip] probe=%d noclipHook=%d hitboxHook=%d speedHook=%d reset=%d enabled=%d restart=%d noDeathFx=%d argPatch=%d soundPatch=%d speed=%.2f hitbox=%.2f",
                       gBinaryOK, gNoclipHooked, gHitboxHooked, gUpdateHooked, gResetOK,
-                      gEnabled, gAutoRestart, gSpeed, gHitbox);
+                      gEnabled, gAutoRestart, gNoDeathFx,
+                      gNoDeathFxArgPatched, gNoDeathFxSoundPatched, gSpeed, gHitbox);
 
                 __block NSInteger tries = 0;
                 void (^tryInstall)(void) = ^{
