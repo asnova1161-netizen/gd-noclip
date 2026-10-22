@@ -35,30 +35,53 @@
 #define GD_LAYER_DYING   0x30a2
 #define GD_LEVEL_TIME    0x390
 
+// PlayerObject vtable slot 164 is getObjectRect().  The function at slot 164
+// delegates to getObjectRect(w,h) and returns the player's collision rectangle.
+// Scaling that rectangle is the hitbox multiplier: a smaller player hitbox lets
+// the player sink deeper into spikes and solids before the collision triggers.
+#define GD_PLAYER_VTABLE_OFF 0x7cdb10ULL
+#define GD_PLAYER_RECT_OFF   0x262708ULL
+#define GD_PLAYER_RECT_SLOT  164
+
 #define GD_SPEED_MIN     0.1f
 #define GD_SPEED_MAX     100.0f
+#define GD_HITBOX_MIN    0.10f
+#define GD_HITBOX_MAX    1.00f
 
 static BOOL        gEnabled = NO;
 static BOOL        gAutoRestart = NO;
 static BOOL        gBinaryOK = NO;
 static BOOL        gResetOK = NO;
 static BOOL        gPlayerResetOK = NO;
+static BOOL        gHitboxOK = NO;
 static BOOL        gResetting = NO;
 static BOOL        gResetRequested = NO;
 static BOOL        gUpdateHooked = NO;
+static BOOL        gNoclipHooked = NO;
+static BOOL        gHitboxHooked = NO;
 static void       *gResetLayer = NULL;
 static CFTimeInterval gLastReset = 0.0;
 static CFTimeInterval gNoRestartUntil = 0.0;
 static uintptr_t   gImageBase = 0;
 static void       *gOrigDestroyPlayer = NULL;
 static void       *gOrigUpdate = NULL;
+static void       *gOrigPlayerRect = NULL;
 static float       gSpeed = 1.0f;
 static float       gCurrentSpeed = 1.0f;
+static float       gHitbox = 1.0f;
 
 typedef void (*DestroyPlayerFn)(void *self, void *player, void *object);
 typedef void (*UpdateFn)(void *self, float dt);
 typedef void (*ResetLevelFn)(void *self);
 typedef void (*PlayerResetFn)(void *player);
+typedef struct { float x, y, w, h; } NJRect;
+typedef void *(*PlayerRectFn)(void *self);
+
+// getObjectRect() returns a reference.  Keep a few stable backing rectangles so
+// a caller that holds one briefly cannot be surprised by the next call.  GD's
+// collision code copies the rectangle immediately, so this is sufficient.
+static NJRect gPlayerRects[8];
+static unsigned gPlayerRectIndex = 0;
 
 static float NJSpeedToSlider(float speed)
 {
@@ -209,17 +232,114 @@ static void gd_probe(void)
     gBinaryOK = YES;
     gResetOK = (*(uint32_t *)(gImageBase + GD_RESET_OFF) == 0xd10303ff); // sub sp, sp, #0xc0
     gPlayerResetOK = (*(uint32_t *)(gImageBase + GD_PLAYER_RESET_OFF) == 0xa9be4ff4); // stp x20,x19,[sp,#-0x20]!
+
+    // Validate the PlayerObject vtable and getObjectRect() slot before using
+    // the hitbox multiplier.  The typeinfo name is the final safety check.
+    uintptr_t playerVT = gImageBase + GD_PLAYER_VTABLE_OFF;
+    uintptr_t typeInfo = *(uintptr_t *)(playerVT - sizeof(void *));
+    const char *typeName = typeInfo ? *(const char **)(typeInfo + sizeof(void *)) : NULL;
+    void **rectSlot = (void **)(playerVT + GD_PLAYER_RECT_SLOT * sizeof(void *));
+    if (typeName && strcmp(typeName, "12PlayerObject") == 0 &&
+        *rectSlot == (void *)(gImageBase + GD_PLAYER_RECT_OFF)) {
+        gOrigPlayerRect = *rectSlot;
+        gHitboxOK = YES;
+    }
 }
 
-static BOOL gd_install_vtable_hook(void)
+static BOOL gd_install_noclip_hook(void)
 {
     if (!gBinaryOK) return NO;
     void **slot = (void **)(gImageBase + GD_VTABLE_OFF + GD_VTABLE_SLOT * 8);
-    if (*slot == (void *)&noclip_destroy_player) return YES;
+    if (*slot == (void *)&noclip_destroy_player) {
+        gNoclipHooked = YES;
+        return YES;
+    }
     if (*slot != gOrigDestroyPlayer) return NO;
     if (!vm_protect_span(slot, sizeof(void *), VM_PROT_READ | VM_PROT_WRITE, NO)) return NO;
     *slot = (void *)&noclip_destroy_player;
+    gNoclipHooked = YES;
     return YES;
+}
+
+static void gd_uninstall_noclip_hook(void)
+{
+    if (!gNoclipHooked || !gOrigDestroyPlayer) return;
+    void **slot = (void **)(gImageBase + GD_VTABLE_OFF + GD_VTABLE_SLOT * 8);
+    if (*slot != (void *)&noclip_destroy_player) { gNoclipHooked = NO; return; }
+    if (!vm_protect_span(slot, sizeof(void *), VM_PROT_READ | VM_PROT_WRITE, NO)) return;
+    *slot = gOrigDestroyPlayer;
+    gNoclipHooked = NO;
+}
+
+// Noclip is now installed only while the toggle is on.  With all features off
+// the game runs with its original vtables, which also makes a 0% hang easy to
+// distinguish from a game/save problem.
+static void gd_sync_noclip_hook(void)
+{
+    if (!gBinaryOK || !gEnabled) {
+        gd_uninstall_noclip_hook();
+    } else {
+        gd_install_noclip_hook();
+    }
+}
+
+static void *noclip_player_rect(void *self)
+{
+    if (!gOrigPlayerRect) return NULL;
+    NJRect *src = (NJRect *)((PlayerRectFn)gOrigPlayerRect)(self);
+    if (!src) return NULL;
+
+    NJRect *out = &gPlayerRects[gPlayerRectIndex++ & 7u];
+    *out = *src;
+
+    float scale = gHitbox;
+    if (!isfinite(scale) || scale < GD_HITBOX_MIN) scale = GD_HITBOX_MIN;
+    if (scale > GD_HITBOX_MAX) scale = GD_HITBOX_MAX;
+    if (scale < GD_HITBOX_MAX - 0.0005f) {
+        float cx = out->x + out->w * 0.5f;
+        float cy = out->y + out->h * 0.5f;
+        out->w *= scale;
+        out->h *= scale;
+        out->x = cx - out->w * 0.5f;
+        out->y = cy - out->h * 0.5f;
+    }
+    return out;
+}
+
+static BOOL gd_install_hitbox_hook(void)
+{
+    if (!gBinaryOK || !gHitboxOK) return NO;
+    if (gHitbox >= GD_HITBOX_MAX - 0.0005f) return NO;
+    void **slot = (void **)(gImageBase + GD_PLAYER_VTABLE_OFF + GD_PLAYER_RECT_SLOT * 8);
+    if (*slot == (void *)&noclip_player_rect) {
+        gHitboxHooked = YES;
+        return YES;
+    }
+    if (*slot != gOrigPlayerRect) return NO;
+    if (!vm_protect_span(slot, sizeof(void *), VM_PROT_READ | VM_PROT_WRITE, NO)) return NO;
+    *slot = (void *)&noclip_player_rect;
+    gHitboxHooked = YES;
+    return YES;
+}
+
+static void gd_uninstall_hitbox_hook(void)
+{
+    if (!gHitboxHooked || !gOrigPlayerRect) return;
+    void **slot = (void **)(gImageBase + GD_PLAYER_VTABLE_OFF + GD_PLAYER_RECT_SLOT * 8);
+    if (*slot != (void *)&noclip_player_rect) { gHitboxHooked = NO; return; }
+    if (!vm_protect_span(slot, sizeof(void *), VM_PROT_READ | VM_PROT_WRITE, NO)) return;
+    *slot = gOrigPlayerRect;
+    gHitboxHooked = NO;
+}
+
+static void gd_sync_hitbox_hook(void)
+{
+    if (!gBinaryOK || !gHitboxOK ||
+        gHitbox >= GD_HITBOX_MAX - 0.0005f) {
+        gd_uninstall_hitbox_hook();
+    } else {
+        gd_install_hitbox_hook();
+    }
 }
 
 static BOOL gd_install_update_hook(void)
@@ -271,7 +391,8 @@ static void gd_sync_update_hook(void)
 static void noclip_set_enabled(BOOL on)
 {
     gEnabled = on;
-    NSLog(@"[noclip] enabled=%d (vtable hook only)", on);
+    gd_sync_noclip_hook();
+    NSLog(@"[noclip] enabled=%d hook=%d", on, gNoclipHooked);
     [[NSUserDefaults standardUserDefaults] setBool:on forKey:@"noclip.enabled"];
 }
 
@@ -346,6 +467,8 @@ static UILabel *NJLabel(NSString *text, CGFloat size, UIFontWeight weight, UICol
 @property (nonatomic, strong) UISwitch *restartToggle;
 @property (nonatomic, strong) UISlider *speedSlider;
 @property (nonatomic, strong) UILabel *speedValue;
+@property (nonatomic, strong) UISlider *hitboxSlider;
+@property (nonatomic, strong) UILabel *hitboxValue;
 @property (nonatomic, assign) BOOL panelVisible;
 @property (nonatomic, assign) BOOL draggingTrigger;
 @property (nonatomic, assign) BOOL draggingPanel;
@@ -461,7 +584,7 @@ static UILabel *NJLabel(NSString *text, CGFloat size, UIFontWeight weight, UICol
 - (void)buildPanel
 {
     CGFloat pw = 300.0;
-    CGFloat ph = 180.0;
+    CGFloat ph = 220.0;
     self.panel = [[UIView alloc] initWithFrame:CGRectMake(0, 0, pw, ph)];
     self.panel.backgroundColor = NJPanel();
     self.panel.layer.cornerRadius = 16.0;
@@ -552,6 +675,34 @@ static UILabel *NJLabel(NSString *text, CGFloat size, UIFontWeight weight, UICol
     [self.restartToggle addTarget:self action:@selector(restartChanged:) forControlEvents:UIControlEventValueChanged];
     [self.panel addSubview:self.restartToggle];
 
+    UIView *line4 = [[UIView alloc] initWithFrame:CGRectMake(16, 170, pw - 32, 1)];
+    line4.backgroundColor = NJLine();
+    [self.panel addSubview:line4];
+
+    // Hitbox multiplier: 1.00x is the untouched player hitbox.  Moving the
+    // slider left shrinks only the player's collision rectangle, so spikes and
+    // solid obstacles can overlap the sprite before a death is triggered.
+    UILabel *hitboxLabel = NJLabel(@"Hitbox", 13.0, UIFontWeightSemibold, NJText(), 0.0);
+    hitboxLabel.frame = CGRectMake(16, 182, 82, 18);
+    [self.panel addSubview:hitboxLabel];
+
+    self.hitboxSlider = [[UISlider alloc] initWithFrame:CGRectMake(102, 175, 116, 31)];
+    self.hitboxSlider.minimumValue = GD_HITBOX_MIN;
+    self.hitboxSlider.maximumValue = GD_HITBOX_MAX;
+    self.hitboxSlider.value = gHitbox;
+    self.hitboxSlider.minimumTrackTintColor = NJAccent();
+    self.hitboxSlider.maximumTrackTintColor = [UIColor colorWithWhite:1.0 alpha:0.12];
+    self.hitboxSlider.thumbTintColor = [UIColor whiteColor];
+    self.hitboxSlider.continuous = YES;
+    [self.hitboxSlider addTarget:self action:@selector(hitboxChanged:) forControlEvents:UIControlEventValueChanged];
+    [self.hitboxSlider addTarget:self action:@selector(hitboxCommitted:) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside | UIControlEventTouchCancel];
+    [self.panel addSubview:self.hitboxSlider];
+
+    self.hitboxValue = NJLabel([NSString stringWithFormat:@"%.2f\u00d7", gHitbox], 12.0, UIFontWeightSemibold, NJText(), 0.0);
+    self.hitboxValue.textAlignment = NSTextAlignmentRight;
+    self.hitboxValue.frame = CGRectMake(pw - 72, 182, 56, 18);
+    [self.panel addSubview:self.hitboxValue];
+
     [self.view addSubview:self.panel];
 }
 
@@ -581,6 +732,22 @@ static UILabel *NJLabel(NSString *text, CGFloat size, UIFontWeight weight, UICol
     gAutoRestart = sender.isOn;
     [[NSUserDefaults standardUserDefaults] setBool:gAutoRestart forKey:@"noclip.instantRestart"];
     gd_sync_update_hook();
+}
+
+- (void)hitboxChanged:(UISlider *)sender
+{
+    float value = sender.value;
+    if (!isfinite(value)) value = GD_HITBOX_MAX;
+    if (value < GD_HITBOX_MIN) value = GD_HITBOX_MIN;
+    if (value > GD_HITBOX_MAX) value = GD_HITBOX_MAX;
+    gHitbox = value;
+    self.hitboxValue.text = [NSString stringWithFormat:@"%.2f\u00d7", value];
+    gd_sync_hitbox_hook();
+}
+
+- (void)hitboxCommitted:(UISlider *)sender
+{
+    [[NSUserDefaults standardUserDefaults] setFloat:gHitbox forKey:@"noclip.hitbox"];
 }
 
 - (void)closeTapped:(id)sender
@@ -759,12 +926,14 @@ static void noclip_boot(void)
             gImageBase = (uintptr_t)_dyld_get_image_header(0);
 
             // One-time recovery from builds that could leave an extreme saved
-            // speed / instant-restart state behind. Start this build on the
-            // game's untouched 1.00x timing path and let the user opt in again.
+            // speed / instant-restart / noclip state behind.  This revision
+            // starts with every hook disabled: if a level still hangs at 0%,
+            // the tweak is not touching the game at all.
             NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-            if ([defaults integerForKey:@"noclip.safeBootRevision"] < 3) {
-                [defaults setInteger:3 forKey:@"noclip.safeBootRevision"];
+            if ([defaults integerForKey:@"noclip.safeBootRevision"] < 4) {
+                [defaults setInteger:4 forKey:@"noclip.safeBootRevision"];
                 [defaults setFloat:1.0f forKey:@"noclip.speed"];
+                [defaults setFloat:1.0f forKey:@"noclip.hitbox"];
                 [defaults setBool:NO forKey:@"noclip.enabled"];
                 [defaults setBool:NO forKey:@"noclip.instantRestart"];
                 [defaults synchronize];
@@ -777,13 +946,19 @@ static void noclip_boot(void)
             if (gSpeed < GD_SPEED_MIN) gSpeed = GD_SPEED_MIN;
             if (gSpeed > GD_SPEED_MAX) gSpeed = GD_SPEED_MAX;
             gCurrentSpeed = gSpeed;
+            gHitbox = [defaults floatForKey:@"noclip.hitbox"];
+            if (!isfinite(gHitbox) || gHitbox <= 0.0f) gHitbox = GD_HITBOX_MAX;
+            if (gHitbox < GD_HITBOX_MIN) gHitbox = GD_HITBOX_MIN;
+            if (gHitbox > GD_HITBOX_MAX) gHitbox = GD_HITBOX_MAX;
 
             dispatch_async(dispatch_get_main_queue(), ^{
                 gd_probe();
-                BOOL hooked = gd_install_vtable_hook();
+                gd_sync_noclip_hook();
+                gd_sync_hitbox_hook();
                 gd_sync_update_hook();
-                NSLog(@"[noclip] probe=%d vtableHook=%d speedHook=%d reset=%d enabled=%d restart=%d speed=%.2f",
-                      gBinaryOK, hooked, gUpdateHooked, gResetOK, gEnabled, gAutoRestart, gSpeed);
+                NSLog(@"[noclip] probe=%d noclipHook=%d hitboxHook=%d speedHook=%d reset=%d enabled=%d restart=%d speed=%.2f hitbox=%.2f",
+                      gBinaryOK, gNoclipHooked, gHitboxHooked, gUpdateHooked, gResetOK,
+                      gEnabled, gAutoRestart, gSpeed, gHitbox);
 
                 __block NSInteger tries = 0;
                 void (^tryInstall)(void) = ^{
