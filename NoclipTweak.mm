@@ -29,6 +29,7 @@
 #define GD_UPDATE_SLOT   5
 
 #define GD_RESET_OFF     0x11a550ULL
+#define GD_RESET_FROM_START_OFF 0x123194ULL
 #define GD_PLAYER_RESET_OFF 0x22f3d4ULL
 #define GD_RESTART_FLAG  0x367e
 #define GD_PLAYER_DEAD   0x9da
@@ -61,6 +62,7 @@ static BOOL        gEnabled = NO;
 static BOOL        gAutoRestart = NO;
 static BOOL        gBinaryOK = NO;
 static BOOL        gResetOK = NO;
+static BOOL        gResetFromStartOK = NO;
 static BOOL        gPlayerResetOK = NO;
 static BOOL        gHitboxOK = NO;
 static BOOL        gObjectHitboxOK = NO;
@@ -184,7 +186,11 @@ static void noclip_update(void *self, float dt)
                 *(uint8_t *)((char *)p2 + GD_PLAYER_DEAD) = 0;
             }
 
-            ((ResetLevelFn)(gImageBase + GD_RESET_OFF))(self);
+            if (gResetFromStartOK) {
+                ((ResetLevelFn)(gImageBase + GD_RESET_FROM_START_OFF))(self);
+            } else {
+                ((ResetLevelFn)(gImageBase + GD_RESET_OFF))(self);
+            }
             *((uint8_t *)self + GD_RESTART_FLAG) = 0;
             *((uint8_t *)self + GD_LAYER_DYING) = 0;
 
@@ -262,6 +268,7 @@ static void gd_probe(void)
     gOrigDestroyPlayer = (void *)fn;
     gBinaryOK = YES;
     gResetOK = (*(uint32_t *)(gImageBase + GD_RESET_OFF) == 0xd10303ff); // sub sp, sp, #0xc0
+    gResetFromStartOK = (*(uint32_t *)(gImageBase + GD_RESET_FROM_START_OFF) == 0xa9bd57f6); // stp x22,x21,[sp,#-0x30]!
     gPlayerResetOK = (*(uint32_t *)(gImageBase + GD_PLAYER_RESET_OFF) == 0xa9be4ff4); // stp x20,x19,[sp,#-0x20]!
 
     // Validate the PlayerObject vtable and getObjectRect() slot before using
