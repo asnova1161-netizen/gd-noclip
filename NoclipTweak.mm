@@ -28,15 +28,6 @@
 #define GD_UPDATE_OFF    0x202c74ULL
 #define GD_UPDATE_SLOT   5
 
-// PlayLayer::update calls this helper to quantize the frame delta to a fixed
-// 1/240 s step. At very low speed the quantizer returns zero on most frames,
-// which makes the cube advance only ~24-30 times per second. NOP the call so
-// PlayLayer receives our smoothly scaled delta directly; the substep logic
-// later in update still divides it into collision steps.
-#define GD_TIMEQ_CALL_OFF 0x202cfcULL
-#define GD_TIMEQ_BL       0x97ffffb8U
-#define GD_ARM64_NOP      0xd503201fU
-
 #define GD_RESET_OFF     0x11a550ULL
 #define GD_PLAYER_RESET_OFF 0x22f3d4ULL
 #define GD_RESTART_FLAG  0x367e
@@ -51,7 +42,6 @@ static BOOL        gAutoRestart = NO;
 static BOOL        gBinaryOK = NO;
 static BOOL        gResetOK = NO;
 static BOOL        gPlayerResetOK = NO;
-static BOOL        gTimingOK = NO;
 static BOOL        gResetting = NO;
 static BOOL        gResetRequested = NO;
 static void       *gResetLayer = NULL;
@@ -212,21 +202,6 @@ static void gd_probe(void)
     gBinaryOK = YES;
     gResetOK = (*(uint32_t *)(gImageBase + GD_RESET_OFF) == 0xd10303ff); // sub sp, sp, #0xc0
     gPlayerResetOK = (*(uint32_t *)(gImageBase + GD_PLAYER_RESET_OFF) == 0xa9be4ff4); // stp x20,x19,[sp,#-0x20]!
-}
-
-static BOOL gd_patch_update_timing(void)
-{
-    if (!gBinaryOK) return NO;
-    uint32_t *insn = (uint32_t *)(gImageBase + GD_TIMEQ_CALL_OFF);
-    if (*insn == GD_ARM64_NOP) { gTimingOK = YES; return YES; }
-    if (*insn != GD_TIMEQ_BL) return NO;
-    if (!vm_protect_span(insn, sizeof(uint32_t),
-                         VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE, YES)) return NO;
-    *insn = GD_ARM64_NOP;
-    sys_icache_invalidate(insn, sizeof(uint32_t));
-    vm_protect_span(insn, sizeof(uint32_t), VM_PROT_READ | VM_PROT_EXECUTE, NO);
-    gTimingOK = YES;
-    return YES;
 }
 
 static BOOL gd_install_vtable_hook(void)
@@ -750,9 +725,8 @@ static void noclip_boot(void)
                 gd_probe();
                 BOOL hooked = gd_install_vtable_hook();
                 BOOL speedHooked = gd_install_update_hook();
-                BOOL timingPatched = gd_patch_update_timing();
-                NSLog(@"[noclip] probe=%d vtableHook=%d speedHook=%d timing=%d reset=%d enabled=%d restart=%d speed=%.2f",
-                      gBinaryOK, hooked, speedHooked, timingPatched, gResetOK, gEnabled, gAutoRestart, gSpeed);
+                NSLog(@"[noclip] probe=%d vtableHook=%d speedHook=%d reset=%d enabled=%d restart=%d speed=%.2f",
+                      gBinaryOK, hooked, speedHooked, gResetOK, gEnabled, gAutoRestart, gSpeed);
 
                 __block NSInteger tries = 0;
                 void (^tryInstall)(void) = ^{
