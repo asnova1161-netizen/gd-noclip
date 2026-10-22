@@ -33,6 +33,7 @@
 #define GD_RESTART_FLAG  0x367e
 #define GD_PLAYER_DEAD   0x9da
 #define GD_LAYER_DYING   0x30a2
+#define GD_LEVEL_TIME    0x390
 
 #define GD_SPEED_MIN     0.1f
 #define GD_SPEED_MAX     100.0f
@@ -44,6 +45,7 @@ static BOOL        gResetOK = NO;
 static BOOL        gPlayerResetOK = NO;
 static BOOL        gResetting = NO;
 static BOOL        gResetRequested = NO;
+static BOOL        gUpdateHooked = NO;
 static void       *gResetLayer = NULL;
 static CFTimeInterval gLastReset = 0.0;
 static CFTimeInterval gNoRestartUntil = 0.0;
@@ -98,6 +100,8 @@ static void noclip_destroy_player(void *self, void *player, void *object)
     if (gOrigDestroyPlayer) ((DestroyPlayerFn)gOrigDestroyPlayer)(self, player, object);
 
     if (!gOrigDestroyPlayer || !gAutoRestart || !gResetOK) return;
+    double levelTime = *(double *)((char *)self + GD_LEVEL_TIME);
+    if (!isfinite(levelTime) || levelTime < 0.5) return; // ignore spawn-time deaths
     if (gResetting || gResetRequested || wasDead || wasDying) return;
     CFTimeInterval now = CACurrentMediaTime();
     if (now < gNoRestartUntil) return;
@@ -170,8 +174,11 @@ static void noclip_update(void *self, float dt)
     if (fabsf(target - gCurrentSpeed) < 0.0005f) gCurrentSpeed = target;
 
     float scale = gCurrentSpeed;
-    if (scale < GD_SPEED_MIN || scale > GD_SPEED_MAX) scale = target;
-    ((UpdateFn)gOrigUpdate)(self, dt * scale);
+    if (!isfinite(scale) || scale < GD_SPEED_MIN || scale > GD_SPEED_MAX) scale = target;
+    float scaled = dt * scale;
+    if (!isfinite(scaled) || scaled < 0.0f) scaled = 0.0f;
+    if (scaled > 2.0f) scaled = 2.0f; // never hand the game an absurd frame delta
+    ((UpdateFn)gOrigUpdate)(self, scaled);
 }
 
 static BOOL vm_protect_span(void *addr, size_t len, vm_prot_t prot, BOOL copy)
@@ -219,12 +226,46 @@ static BOOL gd_install_update_hook(void)
 {
     if (!gBinaryOK) return NO;
     void **slot = (void **)(gImageBase + GD_VTABLE_OFF + GD_UPDATE_SLOT * 8);
-    if (*slot == (void *)&noclip_update) return YES;
+    if (*slot == (void *)&noclip_update) {
+        gUpdateHooked = YES;
+        return YES;
+    }
     if (*slot != (void *)(gImageBase + GD_UPDATE_OFF)) return NO;
     if (!vm_protect_span(slot, sizeof(void *), VM_PROT_READ | VM_PROT_WRITE, NO)) return NO;
     gOrigUpdate = *slot;
     *slot = (void *)&noclip_update;
+    gUpdateHooked = YES;
     return YES;
+}
+
+static void gd_uninstall_update_hook(void)
+{
+    if (!gUpdateHooked || !gOrigUpdate) return;
+    void **slot = (void **)(gImageBase + GD_VTABLE_OFF + GD_UPDATE_SLOT * 8);
+    if (*slot != (void *)&noclip_update) { gUpdateHooked = NO; return; }
+    if (!vm_protect_span(slot, sizeof(void *), VM_PROT_READ | VM_PROT_WRITE, NO)) return;
+    *slot = gOrigUpdate;
+    gUpdateHooked = NO;
+}
+
+// The update intercept is only needed for a non-default speed or for instant
+// restart. Leaving the original PlayLayer::update untouched at 1.00x keeps the
+// game on its exact native timing path.
+static BOOL gd_update_hook_needed(void)
+{
+    return gAutoRestart ||
+           fabsf(gSpeed - 1.0f) > 0.0001f ||
+           fabsf(gCurrentSpeed - 1.0f) > 0.0001f;
+}
+
+static void gd_sync_update_hook(void)
+{
+    if (!gBinaryOK) return;
+    if (gd_update_hook_needed()) {
+        gd_install_update_hook();
+    } else {
+        gd_uninstall_update_hook();
+    }
 }
 
 static void noclip_set_enabled(BOOL on)
@@ -524,8 +565,10 @@ static UILabel *NJLabel(NSString *text, CGFloat size, UIFontWeight weight, UICol
     // Do not assign sender.value from inside this callback and do not snap to
     // 1.0 while the finger is down: both make the thumb jump under a slow drag.
     float value = NJSliderToSpeed(sender.value);
+    if (!isfinite(value)) value = 1.0f;
     gSpeed = value;
     self.speedValue.text = NJSpeedText(value);
+    gd_sync_update_hook();
 }
 
 - (void)speedCommitted:(UISlider *)sender
@@ -537,6 +580,7 @@ static UILabel *NJLabel(NSString *text, CGFloat size, UIFontWeight weight, UICol
 {
     gAutoRestart = sender.isOn;
     [[NSUserDefaults standardUserDefaults] setBool:gAutoRestart forKey:@"noclip.instantRestart"];
+    gd_sync_update_hook();
 }
 
 - (void)closeTapped:(id)sender
@@ -713,10 +757,23 @@ static void noclip_boot(void)
     dispatch_once(&onceToken, ^{
         @autoreleasepool {
             gImageBase = (uintptr_t)_dyld_get_image_header(0);
-            gEnabled = [[NSUserDefaults standardUserDefaults] boolForKey:@"noclip.enabled"];
-            gAutoRestart = [[NSUserDefaults standardUserDefaults] boolForKey:@"noclip.instantRestart"];
-            gSpeed = [[NSUserDefaults standardUserDefaults] floatForKey:@"noclip.speed"];
-            if (gSpeed <= 0.0f) gSpeed = 1.0f;
+
+            // One-time recovery from builds that could leave an extreme saved
+            // speed / instant-restart state behind. Start this build on the
+            // game's untouched 1.00x timing path and let the user opt in again.
+            NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+            if ([defaults integerForKey:@"noclip.safeBootRevision"] < 3) {
+                [defaults setInteger:3 forKey:@"noclip.safeBootRevision"];
+                [defaults setFloat:1.0f forKey:@"noclip.speed"];
+                [defaults setBool:NO forKey:@"noclip.enabled"];
+                [defaults setBool:NO forKey:@"noclip.instantRestart"];
+                [defaults synchronize];
+            }
+
+            gEnabled = [defaults boolForKey:@"noclip.enabled"];
+            gAutoRestart = [defaults boolForKey:@"noclip.instantRestart"];
+            gSpeed = [defaults floatForKey:@"noclip.speed"];
+            if (!isfinite(gSpeed) || gSpeed <= 0.0f) gSpeed = 1.0f;
             if (gSpeed < GD_SPEED_MIN) gSpeed = GD_SPEED_MIN;
             if (gSpeed > GD_SPEED_MAX) gSpeed = GD_SPEED_MAX;
             gCurrentSpeed = gSpeed;
@@ -724,9 +781,9 @@ static void noclip_boot(void)
             dispatch_async(dispatch_get_main_queue(), ^{
                 gd_probe();
                 BOOL hooked = gd_install_vtable_hook();
-                BOOL speedHooked = gd_install_update_hook();
+                gd_sync_update_hook();
                 NSLog(@"[noclip] probe=%d vtableHook=%d speedHook=%d reset=%d enabled=%d restart=%d speed=%.2f",
-                      gBinaryOK, hooked, speedHooked, gResetOK, gEnabled, gAutoRestart, gSpeed);
+                      gBinaryOK, hooked, gUpdateHooked, gResetOK, gEnabled, gAutoRestart, gSpeed);
 
                 __block NSInteger tries = 0;
                 void (^tryInstall)(void) = ^{
