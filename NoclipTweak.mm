@@ -12,7 +12,6 @@
 #import <objc/runtime.h>
 #import <mach/vm_map.h>
 #import <mach-o/dyld.h>
-#import <libkern/OSCacheControl.h>
 
 #include <stdint.h>
 #include <string.h>
@@ -37,20 +36,17 @@
 #define GD_LAYER_DYING   0x30a2
 #define GD_LEVEL_TIME    0x390
 
-// Inside PlayLayer::destroyPlayer(), the player's death routine is called with
-// noEffects = 0.  That flag makes PlayerObject::playerDestroyed skip the
-// explosion animation/particles while keeping the normal death, attempt count,
-// game-over state, and Instant Restart behaviour intact.  The next instruction
-// pair plays explode_11.ogg; if the user wants the effect fully gone, skip that
-// sound block too.  Both instructions are verified before any write so a
-// different game build can never be corrupted by this tweak.
-#define GD_NOFX_ARG_OFF   0x1201b4ULL
-#define GD_NOFX_ARG_ORIG  0x52800001U   // mov w1, #0
-#define GD_NOFX_ARG_PATCH 0x52800021U   // mov w1, #1
+// PlayerObject::m_playLayer is at +0x7ac.  PlayerObject::playerDestroyed()
+// only plays the death explosion when this flag is set (and noEffects is
+// false).  Clearing it for the duration of the original destroyPlayer call is
+// data-only: no executable page is modified, so iOS code-signing protection
+// cannot kill the app.  The flag is restored immediately afterwards.
+#define GD_PLAYER_PLAY_LAYER 0x7ac
 
-#define GD_NOFX_SOUND_OFF   0x120448ULL
-#define GD_NOFX_SOUND_ORIG  0x35000248U // cbnz w8, #0x120490
-#define GD_NOFX_SOUND_PATCH 0x14000012U // b #0x120490
+// PlayLayer's death-sound flag (the same byte read just before explode_11.ogg
+// in destroyPlayer).  Setting it only for the original call skips the sound
+// without changing the normal game-over flow.
+#define GD_LAYER_NO_DEATH_SOUND 0x4bc
 
 // PlayerObject vtable slot 164 is getObjectRect().  The function at slot 164
 // delegates to getObjectRect(w,h) and returns the player's collision rectangle.
@@ -82,11 +78,7 @@ static BOOL        gResetFromStartOK = NO;
 static BOOL        gPlayerResetOK = NO;
 static BOOL        gHitboxOK = NO;
 static BOOL        gObjectHitboxOK = NO;
-static BOOL        gDeathFxOK = NO;
-static BOOL        gDeathFxSoundOK = NO;
 static BOOL        gNoDeathFx = NO;
-static BOOL        gNoDeathFxArgPatched = NO;
-static BOOL        gNoDeathFxSoundPatched = NO;
 static BOOL        gSpeedEngaged = NO;
 static BOOL        gResetting = NO;
 static BOOL        gResetRequested = NO;
@@ -146,7 +138,34 @@ static void noclip_destroy_player(void *self, void *player, void *object)
     if (gEnabled) return;           // noclip: swallow the death
     if (gResetting) return;         // ignore deaths caused by our own reset
 
+    // No Death FX: temporarily mark the player as "not in a play layer".  The
+    // normal death routine then skips only its playerDestroyed explosion path;
+    // death state, attempts, game-over and Instant Restart continue normally.
+    void *fxPlayer = player;
+    if (!fxPlayer) fxPlayer = *(void **)((char *)self + 0xc90);
+    uint8_t savedPlayLayer = 0;
+    BOOL restorePlayLayer = NO;
+    uint8_t savedDeathSound = 0;
+    BOOL restoreDeathSound = NO;
+    if (gNoDeathFx && self) {
+        savedDeathSound = *(uint8_t *)((char *)self + GD_LAYER_NO_DEATH_SOUND);
+        *(uint8_t *)((char *)self + GD_LAYER_NO_DEATH_SOUND) = 1;
+        restoreDeathSound = YES;
+    }
+    if (gNoDeathFx && fxPlayer) {
+        savedPlayLayer = *(uint8_t *)((char *)fxPlayer + GD_PLAYER_PLAY_LAYER);
+        *(uint8_t *)((char *)fxPlayer + GD_PLAYER_PLAY_LAYER) = 0;
+        restorePlayLayer = YES;
+    }
+
     if (gOrigDestroyPlayer) ((DestroyPlayerFn)gOrigDestroyPlayer)(self, player, object);
+
+    if (restorePlayLayer && fxPlayer) {
+        *(uint8_t *)((char *)fxPlayer + GD_PLAYER_PLAY_LAYER) = savedPlayLayer;
+    }
+    if (restoreDeathSound && self) {
+        *(uint8_t *)((char *)self + GD_LAYER_NO_DEATH_SOUND) = savedDeathSound;
+    }
 
     if (!gOrigDestroyPlayer || !gAutoRestart || !gResetOK) return;
     // Any real death is enough.  Do not gate this on level time or a cooldown:
@@ -256,71 +275,6 @@ static BOOL vm_protect_span(void *addr, size_t len, vm_prot_t prot, BOOL copy)
     return kr == KERN_SUCCESS;
 }
 
-// Patching one instruction in PlayLayer::destroyPlayer is enough to make the
-// game's own death routine take the "no effects" path.  The expected original
-// value is checked first, and the page is made writable only for the write
-// itself.  This is intentionally not an inline branch hook: no executable
-// trampoline or relocation is involved.
-static BOOL gd_patch_code_word(uintptr_t off, uint32_t from, uint32_t to)
-{
-    if (!gImageBase) return NO;
-    uint32_t *insn = (uint32_t *)(gImageBase + off);
-    if (*insn == to) return YES;
-    if (*insn != from) return NO;
-
-    // VM_PROT_COPY gives us a private copy of the executable page.  Some
-    // TrollStore/device combinations reject adding write access without it.
-    if (!vm_protect_span(insn, sizeof(*insn),
-                         VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE, YES)) {
-        if (!vm_protect_span(insn, sizeof(*insn),
-                             VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE, NO)) {
-            return NO;
-        }
-    }
-
-    *insn = to;
-    sys_icache_invalidate(insn, sizeof(*insn));
-
-    // Put the page back to executable-only.  A failure here is not fatal: the
-    // instruction is already written and the code cache was invalidated.
-    vm_protect_span(insn, sizeof(*insn), VM_PROT_READ | VM_PROT_EXECUTE, NO);
-    return *insn == to;
-}
-
-// "No Death FX" is implemented by changing the noEffects argument that
-// PlayLayer::destroyPlayer passes to PlayerObject::playerDestroyed.  The normal
-// death path still runs (attempt count, game-over, retry, Instant Restart), but
-// the explosion animation/particles are skipped.  The adjacent death-sound
-// block is skipped as well, so the death is visually and audibly silent.
-static void gd_sync_death_fx(void)
-{
-    if (!gBinaryOK) return;
-
-    if (gNoDeathFx) {
-        if (gDeathFxOK && !gNoDeathFxArgPatched) {
-            gNoDeathFxArgPatched = gd_patch_code_word(
-                GD_NOFX_ARG_OFF, GD_NOFX_ARG_ORIG, GD_NOFX_ARG_PATCH);
-        }
-        if (gDeathFxSoundOK && !gNoDeathFxSoundPatched) {
-            gNoDeathFxSoundPatched = gd_patch_code_word(
-                GD_NOFX_SOUND_OFF, GD_NOFX_SOUND_ORIG, GD_NOFX_SOUND_PATCH);
-        }
-    } else {
-        if (gNoDeathFxArgPatched) {
-            if (gd_patch_code_word(GD_NOFX_ARG_OFF, GD_NOFX_ARG_PATCH,
-                                   GD_NOFX_ARG_ORIG)) {
-                gNoDeathFxArgPatched = NO;
-            }
-        }
-        if (gNoDeathFxSoundPatched) {
-            if (gd_patch_code_word(GD_NOFX_SOUND_OFF, GD_NOFX_SOUND_PATCH,
-                                   GD_NOFX_SOUND_ORIG)) {
-                gNoDeathFxSoundPatched = NO;
-            }
-        }
-    }
-}
-
 static void gd_probe(void)
 {
     gImageBase = (uintptr_t)_dyld_get_image_header(0);
@@ -341,14 +295,6 @@ static void gd_probe(void)
     gResetOK = (*(uint32_t *)(gImageBase + GD_RESET_OFF) == 0xd10303ff); // sub sp, sp, #0xc0
     gResetFromStartOK = (*(uint32_t *)(gImageBase + GD_RESET_FROM_START_OFF) == 0xa9bd57f6); // stp x22,x21,[sp,#-0x30]!
     gPlayerResetOK = (*(uint32_t *)(gImageBase + GD_PLAYER_RESET_OFF) == 0xa9be4ff4); // stp x20,x19,[sp,#-0x20]!
-
-    // Death-FX patch sites.  They are inside the already-validated
-    // PlayLayer::destroyPlayer() function.
-    uint32_t noFxArg = *(uint32_t *)(gImageBase + GD_NOFX_ARG_OFF);
-    uint32_t noFxSound = *(uint32_t *)(gImageBase + GD_NOFX_SOUND_OFF);
-    gDeathFxOK = (noFxArg == GD_NOFX_ARG_ORIG || noFxArg == GD_NOFX_ARG_PATCH);
-    gDeathFxSoundOK = (noFxSound == GD_NOFX_SOUND_ORIG ||
-                       noFxSound == GD_NOFX_SOUND_PATCH);
 
     // Validate the PlayerObject vtable and getObjectRect() slot before using
     // the hitbox multiplier.  The typeinfo name is the final safety check.
@@ -432,13 +378,13 @@ static void gd_uninstall_noclip_hook(void)
     gNoclipHooked = NO;
 }
 
-// destroyPlayer is needed by both features: Noclip swallows the death, while
-// Instant Restart observes a real death.  Keep the hook installed when either
-// toggle is on.  This was the reason Instant Restart did nothing when Noclip
-// was off (which is the normal way to test it).
+// destroyPlayer is needed by all three death-related features: Noclip swallows
+// the death, Instant Restart observes a real death, and No Death FX temporarily
+// clears m_playLayer around the original call.  Keep the hook installed when
+// any of them is on.
 static void gd_sync_noclip_hook(void)
 {
-    if (!gBinaryOK || (!gEnabled && !gAutoRestart)) {
+    if (!gBinaryOK || (!gEnabled && !gAutoRestart && !gNoDeathFx)) {
         gd_uninstall_noclip_hook();
     } else {
         gd_install_noclip_hook();
@@ -957,9 +903,9 @@ static UILabel *NJLabel(NSString *text, CGFloat size, UIFontWeight weight, UICol
 {
     gNoDeathFx = sender.isOn;
     [[NSUserDefaults standardUserDefaults] setBool:gNoDeathFx forKey:@"noclip.noDeathFx"];
-    gd_sync_death_fx();
-    NSLog(@"[noclip] noDeathFx=%d argPatch=%d soundPatch=%d",
-          gNoDeathFx, gNoDeathFxArgPatched, gNoDeathFxSoundPatched);
+    gd_sync_noclip_hook();
+    gd_sync_update_hook();
+    NSLog(@"[noclip] noDeathFx=%d deathHook=%d", gNoDeathFx, gNoclipHooked);
 }
 
 - (void)hitboxChanged:(UISlider *)sender
@@ -1167,6 +1113,16 @@ static void noclip_boot(void)
                 [defaults synchronize];
             }
 
+            // 2.2.1.3 moved No Death FX from an executable-page patch to a
+            // data-only field around the original death call.  The previous
+            // build may have left the toggle on together with a corrupted
+            // code page, so reset it once after installing this build.
+            if ([defaults integerForKey:@"noclip.noDeathFxRevision"] < 1) {
+                [defaults setInteger:1 forKey:@"noclip.noDeathFxRevision"];
+                [defaults setBool:NO forKey:@"noclip.noDeathFx"];
+                [defaults synchronize];
+            }
+
             gEnabled = [defaults boolForKey:@"noclip.enabled"];
             gAutoRestart = [defaults boolForKey:@"noclip.instantRestart"];
             gSpeed = [defaults floatForKey:@"noclip.speed"];
@@ -1187,11 +1143,9 @@ static void noclip_boot(void)
                 gd_sync_noclip_hook();
                 gd_sync_hitbox_hook();
                 gd_sync_update_hook();
-                gd_sync_death_fx();
-                NSLog(@"[noclip] probe=%d noclipHook=%d hitboxHook=%d speedHook=%d reset=%d enabled=%d restart=%d noDeathFx=%d argPatch=%d soundPatch=%d speed=%.2f hitbox=%.2f",
+                NSLog(@"[noclip] probe=%d noclipHook=%d hitboxHook=%d speedHook=%d reset=%d enabled=%d restart=%d noDeathFx=%d speed=%.2f hitbox=%.2f",
                       gBinaryOK, gNoclipHooked, gHitboxHooked, gUpdateHooked, gResetOK,
-                      gEnabled, gAutoRestart, gNoDeathFx,
-                      gNoDeathFxArgPatched, gNoDeathFxSoundPatched, gSpeed, gHitbox);
+                      gEnabled, gAutoRestart, gNoDeathFx, gSpeed, gHitbox);
 
                 __block NSInteger tries = 0;
                 void (^tryInstall)(void) = ^{
