@@ -28,6 +28,15 @@
 #define GD_UPDATE_OFF    0x202c74ULL
 #define GD_UPDATE_SLOT   5
 
+// PlayLayer::update calls this helper to quantize the frame delta to a fixed
+// 1/240 s step. At very low speed the quantizer returns zero on most frames,
+// which makes the cube advance only ~24-30 times per second. NOP the call so
+// PlayLayer receives our smoothly scaled delta directly; the substep logic
+// later in update still divides it into collision steps.
+#define GD_TIMEQ_CALL_OFF 0x202cfcULL
+#define GD_TIMEQ_BL       0x97ffffb8U
+#define GD_ARM64_NOP      0xd503201fU
+
 #define GD_RESET_OFF     0x11a550ULL
 #define GD_PLAYER_RESET_OFF 0x22f3d4ULL
 #define GD_RESTART_FLAG  0x367e
@@ -42,10 +51,12 @@ static BOOL        gAutoRestart = NO;
 static BOOL        gBinaryOK = NO;
 static BOOL        gResetOK = NO;
 static BOOL        gPlayerResetOK = NO;
+static BOOL        gTimingOK = NO;
 static BOOL        gResetting = NO;
 static BOOL        gResetRequested = NO;
 static void       *gResetLayer = NULL;
 static CFTimeInterval gLastReset = 0.0;
+static CFTimeInterval gNoRestartUntil = 0.0;
 static uintptr_t   gImageBase = 0;
 static void       *gOrigDestroyPlayer = NULL;
 static void       *gOrigUpdate = NULL;
@@ -98,12 +109,14 @@ static void noclip_destroy_player(void *self, void *player, void *object)
 
     if (!gOrigDestroyPlayer || !gAutoRestart || !gResetOK) return;
     if (gResetting || gResetRequested || wasDead || wasDying) return;
-    if (CACurrentMediaTime() - gLastReset < 0.10) return;
+    CFTimeInterval now = CACurrentMediaTime();
+    if (now < gNoRestartUntil) return;
+    if (now - gLastReset < 0.10) return;
 
-    // Do the actual reset at the beginning of the next PlayLayer update.
-    // This is a known-good point in the game loop: the death handler has
-    // returned, no object iteration is in progress, and the reset is not
-    // affected by the current speed multiplier.
+    // The game schedules its own auto-retry (the +0x367e flag) after a death.
+    // We perform the reset ourselves on the next PlayLayer update and clear
+    // that flag there, so the delayed retry cannot reset the level a second
+    // time after we have already respawned the player.
     gResetLayer = self;
     gResetRequested = YES;
 }
@@ -118,33 +131,34 @@ static void noclip_update(void *self, float dt)
         gResetLayer = NULL;
         if (layer == self && gAutoRestart && gResetOK && !gResetting) {
             gResetting = YES;
+            CFTimeInterval now = CACurrentMediaTime();
 
-            // Keep the game's own restart flag set while resetLevel runs; the
-            // normal death callback relies on that state. Clear it only after
-            // a successful reset so the later callback cannot reset twice.
+            // destroyPlayer always arms the game's own delayed auto-retry.
+            // Cancel it before and after our immediate reset: otherwise the
+            // delayed callback calls resetLevel a second time, which at very
+            // low speeds turns into an endless death/reset loop.
+            *((uint8_t *)self + GD_RESTART_FLAG) = 0;
             ((ResetLevelFn)(gImageBase + GD_RESET_OFF))(self);
+            *((uint8_t *)self + GD_RESTART_FLAG) = 0;
 
+            // resetLevel normally resets both player objects. If the old death
+            // state is still present at a slow speed, only clear the dead bit.
+            // Do not call PlayerObject::reset here: that zeroes the player's
+            // position and can make the freshly spawned cube die in place.
             void *p1 = *(void **)((char *)self + 0xc90);
-            BOOL stillDead = p1 && *(uint8_t *)((char *)p1 + GD_PLAYER_DEAD);
-            if (stillDead && gPlayerResetOK) {
-                // resetLevel can run before the old death animation has fully
-                // cleared the player, especially at very low speed. Reset the
-                // player state explicitly so it does not immediately die in
-                // place on the first frame after respawning.
-                ((PlayerResetFn)(gImageBase + GD_PLAYER_RESET_OFF))(p1);
-                stillDead = *(uint8_t *)((char *)p1 + GD_PLAYER_DEAD) != 0;
+            if (p1 && *(uint8_t *)((char *)p1 + GD_PLAYER_DEAD)) {
+                *(uint8_t *)((char *)p1 + GD_PLAYER_DEAD) = 0;
+            }
+            void *p2 = *(void **)((char *)self + 0xc98);
+            if (p2 && p2 != p1 && *(uint8_t *)((char *)p2 + GD_PLAYER_DEAD)) {
+                *(uint8_t *)((char *)p2 + GD_PLAYER_DEAD) = 0;
             }
 
-            if (stillDead) {
-                // Let the game's normal delayed restart take over as a
-                // fallback instead of retrying every frame (which would look
-                // like dying in place).
-                *((uint8_t *)self + GD_RESTART_FLAG) = 1;
-            } else {
-                *((uint8_t *)self + GD_RESTART_FLAG) = 0;
-            }
-
-            gLastReset = CACurrentMediaTime();
+            gLastReset = now;
+            // Give the new attempt a moment to settle. If something still
+            // kills the player on the first frame, fall back to the game's
+            // normal delayed retry instead of requesting a reset every frame.
+            gNoRestartUntil = now + 0.35;
             gResetting = NO;
             return; // skip the old death update for this frame
         }
@@ -198,6 +212,21 @@ static void gd_probe(void)
     gBinaryOK = YES;
     gResetOK = (*(uint32_t *)(gImageBase + GD_RESET_OFF) == 0xd10303ff); // sub sp, sp, #0xc0
     gPlayerResetOK = (*(uint32_t *)(gImageBase + GD_PLAYER_RESET_OFF) == 0xa9be4ff4); // stp x20,x19,[sp,#-0x20]!
+}
+
+static BOOL gd_patch_update_timing(void)
+{
+    if (!gBinaryOK) return NO;
+    uint32_t *insn = (uint32_t *)(gImageBase + GD_TIMEQ_CALL_OFF);
+    if (*insn == GD_ARM64_NOP) { gTimingOK = YES; return YES; }
+    if (*insn != GD_TIMEQ_BL) return NO;
+    if (!vm_protect_span(insn, sizeof(uint32_t),
+                         VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE, YES)) return NO;
+    *insn = GD_ARM64_NOP;
+    sys_icache_invalidate(insn, sizeof(uint32_t));
+    vm_protect_span(insn, sizeof(uint32_t), VM_PROT_READ | VM_PROT_EXECUTE, NO);
+    gTimingOK = YES;
+    return YES;
 }
 
 static BOOL gd_install_vtable_hook(void)
@@ -470,11 +499,11 @@ static UILabel *NJLabel(NSString *text, CGFloat size, UIFontWeight weight, UICol
     [self.panel addSubview:line2];
 
     // Speedhack row
-    UILabel *speedLabel = NJLabel(@"Speedhack", 13.0, UIFontWeightSemibold, NJText(), 0.0);
-    speedLabel.frame = CGRectMake(16, 98, 74, 18);
+    UILabel *speedLabel = NJLabel(@"Speedhack", 12.0, UIFontWeightSemibold, NJText(), 0.0);
+    speedLabel.frame = CGRectMake(16, 98, 82, 18);
     [self.panel addSubview:speedLabel];
 
-    self.speedSlider = [[UISlider alloc] initWithFrame:CGRectMake(92, 91, 126, 31)];
+    self.speedSlider = [[UISlider alloc] initWithFrame:CGRectMake(102, 91, 116, 31)];
     self.speedSlider.minimumValue = 0.0f;
     self.speedSlider.maximumValue = 1.0f;
     self.speedSlider.value = NJSpeedToSlider(gSpeed);
@@ -721,8 +750,9 @@ static void noclip_boot(void)
                 gd_probe();
                 BOOL hooked = gd_install_vtable_hook();
                 BOOL speedHooked = gd_install_update_hook();
-                NSLog(@"[noclip] probe=%d vtableHook=%d speedHook=%d reset=%d enabled=%d restart=%d speed=%.2f",
-                      gBinaryOK, hooked, speedHooked, gResetOK, gEnabled, gAutoRestart, gSpeed);
+                BOOL timingPatched = gd_patch_update_timing();
+                NSLog(@"[noclip] probe=%d vtableHook=%d speedHook=%d timing=%d reset=%d enabled=%d restart=%d speed=%.2f",
+                      gBinaryOK, hooked, speedHooked, timingPatched, gResetOK, gEnabled, gAutoRestart, gSpeed);
 
                 __block NSInteger tries = 0;
                 void (^tryInstall)(void) = ^{
