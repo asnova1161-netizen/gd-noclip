@@ -8,6 +8,7 @@
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
+#import <QuartzCore/QuartzCore.h>
 #import <mach/mach.h>
 #import <objc/runtime.h>
 #import <mach/vm_map.h>
@@ -36,12 +37,13 @@
 #define GD_LAYER_DYING   0x30a2
 #define GD_LEVEL_TIME    0x390
 
-// PlayerObject::m_playLayer is at +0x7ac.  PlayerObject::playerDestroyed()
-// only plays the death explosion when this flag is set (and noEffects is
-// false).  Clearing it for the duration of the original destroyPlayer call is
-// data-only: no executable page is modified, so iOS code-signing protection
-// cannot kill the app.  The flag is restored immediately afterwards.
-#define GD_PLAYER_PLAY_LAYER 0x7ac
+// PlayerObject's death-effects flag is at +0x7ac.  PlayerObject::playerDestroyed()
+// and the particle path in releaseAllButtons only create the death explosion
+// when this byte is set.  Clearing it for the duration of the original
+// destroyPlayer call is data-only: no executable page is modified, so iOS
+// code-signing protection cannot kill the app.  The flag is restored
+// immediately afterwards.
+#define GD_PLAYER_DEATH_FX 0x7ac
 
 // PlayLayer's death-sound flag (the same byte read just before explode_11.ogg
 // in destroyPlayer).  Setting it only for the original call skips the sound
@@ -57,13 +59,31 @@
 #define GD_PLAYER_RECT_SLOT  164
 
 // GameObject's primary vtable.  Its getObjectRect() is at slot 164 as well and
-// points at the same implementation as PlayerObject's override.  Hooking both
-// vtables is intentional: shrinking only the player did not change spike deaths
-// on all builds, while shrinking the object rectangle always affects the
-// collision path (and is also what makes the overlap visibly deeper).
+// points at the same implementation as PlayerObject's override.  Both vtables
+// are hooked, but the object hook only scales hazards; solids and slopes keep
+// their native rectangles so low hitbox values cannot fall through the level.
 #define GD_OBJECT_VTABLE_OFF 0x7d9708ULL
 #define GD_OBJECT_RECT_SLOT  164
 #define GD_OBJECT_RECT_OFF   0x262708ULL
+
+// GameObject::m_objectType (2.205) is at +0x398.  The broadphase sends
+// type 0 (Solid) and type 0x15 (Breakable) to the solid list, and type 2
+// (Hazard) and type 0x2f (AnimatedHazard) to the hazard list.  Only shrinking
+// the hazard rectangles makes spikes/animations easier to overlap without
+// making ordinary blocks and slopes collidable only by their centres.
+#define GD_GAMEOBJECT_TYPE_OFF 0x398
+
+// PlayLayer vtable slot 176 (0x11cf04) is the death screen-shake path called
+// by destroyPlayer with a strength of 1.0.  It only reads x0 and s0 and tail
+// calls 0x201644, so it is safe to replace with a guarded (void*, float) hook.
+#define GD_SHAKE_SLOT 176
+#define GD_SHAKE_OFF  0x11cf04ULL
+
+// PlayerObject vtable slot 112 is setOpacity(unsigned char).  The normal death
+// routine calls it with 0 after hiding the death particles.  Restoring 255
+// after destroyPlayer keeps the player icon visible at the death position.
+#define GD_PLAYER_OPACITY_SLOT 112
+#define GD_PLAYER_OPACITY_OFF  0x234f18ULL
 
 #define GD_SPEED_MIN     0.1f
 #define GD_SPEED_MAX     100.0f
@@ -79,6 +99,8 @@ static BOOL        gPlayerResetOK = NO;
 static BOOL        gHitboxOK = NO;
 static BOOL        gObjectHitboxOK = NO;
 static BOOL        gNoDeathFx = NO;
+static BOOL        gDeathShakeOK = NO;
+static BOOL        gDeathOpacityOK = NO;
 static BOOL        gSpeedEngaged = NO;
 static BOOL        gResetting = NO;
 static BOOL        gResetRequested = NO;
@@ -93,6 +115,9 @@ static void       *gOrigDestroyPlayer = NULL;
 static void       *gOrigUpdate = NULL;
 static void       *gOrigPlayerRect = NULL;
 static void       *gOrigObjectRect = NULL;
+static void       *gOrigDeathShake = NULL;
+static void       *gOrigPlayerOpacity = NULL;
+static unsigned    gDeathFxDepth = 0;
 static float       gSpeed = 1.0f;
 static float       gCurrentSpeed = 1.0f;
 static float       gHitbox = 1.0f;
@@ -138,13 +163,14 @@ static void noclip_destroy_player(void *self, void *player, void *object)
     if (gEnabled) return;           // noclip: swallow the death
     if (gResetting) return;         // ignore deaths caused by our own reset
 
-    // No Death FX: temporarily mark the player as "not in a play layer".  The
-    // normal death routine then skips only its playerDestroyed explosion path;
-    // death state, attempts, game-over and Instant Restart continue normally.
+    // No Death FX: temporarily clear the player's death-effects flag.  The
+    // normal death routine then skips the explosion, particles, animation and
+    // sound, while death state, attempts, game-over and Instant Restart
+    // continue normally.
     void *fxPlayer = player;
     if (!fxPlayer) fxPlayer = *(void **)((char *)self + 0xc90);
-    uint8_t savedPlayLayer = 0;
-    BOOL restorePlayLayer = NO;
+    uint8_t savedDeathFx = 0;
+    BOOL restoreDeathFx = NO;
     uint8_t savedDeathSound = 0;
     BOOL restoreDeathSound = NO;
     if (gNoDeathFx && self) {
@@ -153,18 +179,34 @@ static void noclip_destroy_player(void *self, void *player, void *object)
         restoreDeathSound = YES;
     }
     if (gNoDeathFx && fxPlayer) {
-        savedPlayLayer = *(uint8_t *)((char *)fxPlayer + GD_PLAYER_PLAY_LAYER);
-        *(uint8_t *)((char *)fxPlayer + GD_PLAYER_PLAY_LAYER) = 0;
-        restorePlayLayer = YES;
+        savedDeathFx = *(uint8_t *)((char *)fxPlayer + GD_PLAYER_DEATH_FX);
+        *(uint8_t *)((char *)fxPlayer + GD_PLAYER_DEATH_FX) = 0;
+        restoreDeathFx = YES;
     }
+
+    // PlayLayer::destroyPlayer calls the vtable slot 176 shake helper while it
+    // is running.  Mark the scope only for the original call so normal screen
+    // shakes outside the death routine are untouched.
+    BOOL suppressShake = gNoDeathFx;
+    if (suppressShake) gDeathFxDepth++;
 
     if (gOrigDestroyPlayer) ((DestroyPlayerFn)gOrigDestroyPlayer)(self, player, object);
 
-    if (restorePlayLayer && fxPlayer) {
-        *(uint8_t *)((char *)fxPlayer + GD_PLAYER_PLAY_LAYER) = savedPlayLayer;
+    if (suppressShake && gDeathFxDepth > 0) gDeathFxDepth--;
+
+    if (restoreDeathFx && fxPlayer) {
+        *(uint8_t *)((char *)fxPlayer + GD_PLAYER_DEATH_FX) = savedDeathFx;
     }
     if (restoreDeathSound && self) {
         *(uint8_t *)((char *)self + GD_LAYER_NO_DEATH_SOUND) = savedDeathSound;
+    }
+
+    // Clearing the death-effects flag makes playerDestroyed skip the explosion
+    // and finish by setting opacity to 0.  Put the icon's alpha (and all of its
+    // child sprite layers) back so the player remains frozen at the death spot.
+    // The game-over/retry flow is otherwise unchanged.
+    if (gNoDeathFx && fxPlayer && gDeathOpacityOK && gOrigPlayerOpacity) {
+        ((void (*)(void *, unsigned char))gOrigPlayerOpacity)(fxPlayer, 255);
     }
 
     if (!gOrigDestroyPlayer || !gAutoRestart || !gResetOK) return;
@@ -275,6 +317,25 @@ static BOOL vm_protect_span(void *addr, size_t len, vm_prot_t prot, BOOL copy)
     return kr == KERN_SUCCESS;
 }
 
+// Guarded replacement for PlayLayer vtable slot 176.  The original is called
+// exactly as before unless a No Death FX destroyPlayer call is on the stack.
+static void noclip_death_shake(void *self, float strength)
+{
+    if (gNoDeathFx && gDeathFxDepth > 0) return;
+    if (gOrigDeathShake) ((void (*)(void *, float))gOrigDeathShake)(self, strength);
+}
+
+static BOOL gd_install_death_shake_hook(void)
+{
+    if (!gDeathShakeOK || !gOrigDeathShake) return NO;
+    void **slot = (void **)(gImageBase + GD_VTABLE_OFF + GD_SHAKE_SLOT * sizeof(void *));
+    if (*slot == (void *)&noclip_death_shake) return YES;
+    if (*slot != gOrigDeathShake) return NO;
+    if (!vm_protect_span(slot, sizeof(void *), VM_PROT_READ | VM_PROT_WRITE, NO)) return NO;
+    *slot = (void *)&noclip_death_shake;
+    return YES;
+}
+
 static void gd_probe(void)
 {
     gImageBase = (uintptr_t)_dyld_get_image_header(0);
@@ -292,6 +353,13 @@ static void gd_probe(void)
 
     gOrigDestroyPlayer = (void *)fn;
     gBinaryOK = YES;
+
+    void **shakeSlot = (void **)(gImageBase + GD_VTABLE_OFF + GD_SHAKE_SLOT * sizeof(void *));
+    if (*shakeSlot == (void *)(gImageBase + GD_SHAKE_OFF)) {
+        gOrigDeathShake = *shakeSlot;
+        gDeathShakeOK = YES;
+    }
+
     gResetOK = (*(uint32_t *)(gImageBase + GD_RESET_OFF) == 0xd10303ff); // sub sp, sp, #0xc0
     gResetFromStartOK = (*(uint32_t *)(gImageBase + GD_RESET_FROM_START_OFF) == 0xa9bd57f6); // stp x22,x21,[sp,#-0x30]!
     gPlayerResetOK = (*(uint32_t *)(gImageBase + GD_PLAYER_RESET_OFF) == 0xa9be4ff4); // stp x20,x19,[sp,#-0x20]!
@@ -308,6 +376,13 @@ static void gd_probe(void)
         gHitboxOK = YES;
     }
 
+    void **opacitySlot = (void **)(playerVT + GD_PLAYER_OPACITY_SLOT * sizeof(void *));
+    if (typeName && strcmp(typeName, "12PlayerObject") == 0 &&
+        *opacitySlot == (void *)(gImageBase + GD_PLAYER_OPACITY_OFF)) {
+        gOrigPlayerOpacity = *opacitySlot;
+        gDeathOpacityOK = YES;
+    }
+
     // GameObject's primary vtable.  This is the rectangle used when a level
     // object is tested against the player.  Hooking it makes the slider work
     // even if a spike collision bypasses PlayerObject's own getObjectRect().
@@ -320,6 +395,8 @@ static void gd_probe(void)
         gOrigObjectRect = *objectRectSlot;
         gObjectHitboxOK = YES;
     }
+
+    gd_install_death_shake_hook();
 }
 
 // Some TrollStore/patched builds end up with a CADisplayLink capped at 30 Hz
@@ -327,29 +404,62 @@ static void gd_probe(void)
 // slowing/speeding is done in PlayLayer::update, while the display link stays
 // at 60.  Swizzle CCDirectorCaller's display-link callback and pin it to 60.
 static IMP gOrigDoCaller = NULL;
+static void (*gOrigSetPreferredFPS)(id, SEL, NSInteger) = NULL;
+
+static void noclip_pin_display_link(id sender)
+{
+    if (!sender) return;
+    if (![sender respondsToSelector:@selector(preferredFramesPerSecond)] ||
+        ![sender respondsToSelector:@selector(setPreferredFramesPerSecond:)]) return;
+    if ([sender preferredFramesPerSecond] != 60) {
+        [sender setPreferredFramesPerSecond:60];
+    }
+}
+
+// CADisplayLink can be lowered by the game or by a system state change.  Clamp
+// every setter call to 60 as well as pinning the link in the frame callback, so
+// the 30 Hz cap cannot come back while Speedhack is active.
+static void noclip_set_preferred_fps(id self, SEL _cmd, NSInteger fps)
+{
+    if (fps <= 0 || fps < 60) fps = 60;
+    if (gOrigSetPreferredFPS) gOrigSetPreferredFPS(self, _cmd, fps);
+}
 
 static void noclip_do_caller(id self, SEL _cmd, id sender)
 {
-    if (sender &&
-        [sender respondsToSelector:@selector(preferredFramesPerSecond)] &&
-        [sender respondsToSelector:@selector(setPreferredFramesPerSecond:)]) {
-        if ([sender preferredFramesPerSecond] != 60) {
-            [sender setPreferredFramesPerSecond:60];
-        }
-    }
+    // The original computes CCProjection/CCDirector timing and may also touch
+    // the display link.  Pin before and after it so its work cannot leave the
+    // link at 30 while the scaled PlayLayer update is running.
+    noclip_pin_display_link(sender);
     if (gOrigDoCaller) ((void (*)(id, SEL, id))gOrigDoCaller)(self, _cmd, sender);
+    noclip_pin_display_link(sender);
 }
 
 static void gd_install_fps_hook(void)
 {
-    static BOOL installed = NO;
-    if (installed) return;
+    static BOOL callerInstalled = NO;
+    static BOOL linkInstalled = NO;
+
+    Class displayLink = [CADisplayLink class];
+    if (!linkInstalled && displayLink) {
+        Method setter = class_getInstanceMethod(displayLink, @selector(setPreferredFramesPerSecond:));
+        if (setter) {
+            IMP original = method_setImplementation(setter, (IMP)noclip_set_preferred_fps);
+            if (original) {
+                gOrigSetPreferredFPS = (void (*)(id, SEL, NSInteger))original;
+                linkInstalled = YES;
+                NSLog(@"[noclip] CADisplayLink FPS setter hooked for 60 FPS");
+            }
+        }
+    }
+
+    if (callerInstalled) return;
     Class cls = NSClassFromString(@"CCDirectorCaller");
     if (!cls) return;
     Method method = class_getInstanceMethod(cls, @selector(doCaller:));
     if (!method) return;
     gOrigDoCaller = method_setImplementation(method, (IMP)noclip_do_caller);
-    installed = YES;
+    callerInstalled = YES;
     NSLog(@"[noclip] CCDirectorCaller hooked for 60 FPS");
 }
 
@@ -421,6 +531,17 @@ static void *noclip_player_rect(void *self)
 
 static void *noclip_object_rect(void *self)
 {
+    if (!self || !gOrigObjectRect) return NULL;
+
+    // Only hazards (type 2) and animated hazards (type 0x2f) are shrunk.  Solid
+    // blocks (0), breakables (0x15), slopes (0x19) and every other object keep
+    // their native rectangle.  This prevents the 0.10x setting from opening a
+    // gap between the player and ordinary level geometry while still allowing
+    // much deeper overlap with spikes and animated hazards.
+    int objectType = *(int *)((char *)self + GD_GAMEOBJECT_TYPE_OFF);
+    if (objectType != 2 && objectType != 0x2f) {
+        return ((PlayerRectFn)gOrigObjectRect)(self);
+    }
     return noclip_scale_rect(self, (PlayerRectFn)gOrigObjectRect);
 }
 
@@ -843,8 +964,9 @@ static UILabel *NJLabel(NSString *text, CGFloat size, UIFontWeight weight, UICol
     [self.panel addSubview:line5];
 
     // Hitbox multiplier: 1.00x is the untouched player hitbox.  Moving the
-    // slider left shrinks only the player's collision rectangle, so spikes and
-    // solid obstacles can overlap the sprite before a death is triggered.
+    // slider left shrinks the player's collision rectangle and hazard
+    // rectangles, so spikes can overlap the sprite before a death is triggered.
+    // Solid blocks, slopes and breakables keep their normal collision size.
     UILabel *hitboxLabel = NJLabel(@"Hitbox", 13.0, UIFontWeightSemibold, NJText(), 0.0);
     hitboxLabel.frame = CGRectMake(16, 224, 82, 18);
     [self.panel addSubview:hitboxLabel];
@@ -1143,9 +1265,10 @@ static void noclip_boot(void)
                 gd_sync_noclip_hook();
                 gd_sync_hitbox_hook();
                 gd_sync_update_hook();
-                NSLog(@"[noclip] probe=%d noclipHook=%d hitboxHook=%d speedHook=%d reset=%d enabled=%d restart=%d noDeathFx=%d speed=%.2f hitbox=%.2f",
+                NSLog(@"[noclip] probe=%d noclipHook=%d hitboxHook=%d speedHook=%d reset=%d enabled=%d restart=%d noDeathFx=%d shake=%d opacity=%d speed=%.2f hitbox=%.2f",
                       gBinaryOK, gNoclipHooked, gHitboxHooked, gUpdateHooked, gResetOK,
-                      gEnabled, gAutoRestart, gNoDeathFx, gSpeed, gHitbox);
+                      gEnabled, gAutoRestart, gNoDeathFx, gDeathShakeOK, gDeathOpacityOK,
+                      gSpeed, gHitbox);
 
                 __block NSInteger tries = 0;
                 void (^tryInstall)(void) = ^{
